@@ -11,6 +11,7 @@ pub struct ToolContext {
     pub debug: bool,
     pub tools_available: Vec<String>,
     pub max_budget_usd: Option<f64>,
+    pub auto_mode: bool,
 }
 
 pub struct ToolResult {
@@ -37,6 +38,9 @@ pub trait Tool: Send + Sync {
 
     /// The structured description used by the LLM
     fn description(&self) -> &str;
+
+    /// The JSON Schema defining the input parameters (used for OpenAI formatting)
+    fn input_schema(&self) -> serde_json::Value;
 
     /// Optional aliases
     fn aliases(&self) -> Vec<&str> { vec![] }

@@ -27,3 +27,6 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1.89"
+dirs = "6.0.0"
+glob = "0.3.3"
+regex = "1.12.3"

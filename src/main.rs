@@ -2,6 +2,9 @@ pub mod engine;
 pub mod models;
 pub mod tools;
 pub mod ui;
+pub mod mem;
+pub mod keybindings;
+pub mod output_styles;
 
 use clap::Parser;
 use std::sync::Arc;
@@ -22,6 +25,10 @@ struct Args {
     /// Run in bare/simple mode
     #[arg(long, default_value_t = false)]
     bare: bool,
+
+    /// Automatically run commands and bypass permission prompts [Y/n]
+    #[arg(long, default_value_t = false)]
+    auto: bool,
 }
 
 #[tokio::main]
@@ -48,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(q) = args.query {
         info!("Received query: {}", q);
-        let result = engine.query(&q).await;
+        let result = engine.query(&q, None).await;
         
         match result {
             Ok(res) => println!("\n🤖 Agent says:\n{}", res),
@@ -67,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::spawn(async move {
             while let Some(query) = rx_to_engine.recv().await {
-                match engine_clone.query(&query).await {
+                match engine_clone.query(&query, Some(tx_to_ui.clone())).await {
                     Ok(response) => {
                         let _ = tx_to_ui.send(ui::app::UiEvent::LLMResponse(response)).await;
                     }
