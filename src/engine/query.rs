@@ -1,18 +1,15 @@
 use anyhow::{anyhow, Context, Result};
-use async_openai::{
-    types::{
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionToolArgs, ChatCompletionToolType, CreateChatCompletionRequestArgs, FunctionObjectArgs
-    },
-    Client,
-};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Mutex;
 use std::time::Instant;
 use tracing::info;
 
 use crate::engine::cost_tracker::CostTracker;
-
-use crate::tools::{fs::ReadFileTool, fs::WriteFileTool, bash::BashTool, edit::FileEditTool, glob_tool::GlobTool, grep_tool::GrepTool, Tool, ToolContext};
+use crate::tools::{
+    bash::BashTool, edit::FileEditTool, fs::ReadFileTool, fs::WriteFileTool,
+    glob_tool::GlobTool, grep_tool::GrepTool, Tool, ToolContext,
+};
 
 /// Configuration flags that control [`QueryEngine`] behavior.
 #[derive(Debug, Clone)]
@@ -34,19 +31,115 @@ impl Default for EngineConfig {
 
 /// Supported LLM API providers.
 ///
-/// Both are accessed through the OpenAI-compatible chat completions
-/// protocol — Gemini uses its `/v1beta/openai/` gateway.
+/// All providers are accessed through the OpenAI-compatible chat completions
+/// protocol. Each variant maps to a known API base URL.
 pub enum ModelProvider {
+    /// OpenAI — `https://api.openai.com/v1`
     OpenAI,
+    /// Google Gemini — `https://generativelanguage.googleapis.com/v1beta/openai/`
     Gemini,
+    /// OpenRouter — `https://openrouter.ai/api/v1`
+    OpenRouter,
+}
+
+// ── Request / response types for the OpenAI-compatible API ──────────────
+
+/// A single message in the chat conversation.
+///
+/// Uses `#[serde(flatten)]` to capture and re-emit provider-specific
+/// fields (e.g. Gemini's `extra_content` containing `thought_signature`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    /// Captures unknown fields (e.g. `extra_content`) so they round-trip
+    /// correctly when the assistant message is sent back to the API.
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, Value>,
+}
+
+/// A tool-call request from the assistant.
+///
+/// Uses `#[serde(flatten)]` to preserve Gemini's `extra_content`
+/// (containing `thought_signature`) for round-tripping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolCall {
+    id: String,
+    r#type: String,
+    function: FunctionCall,
+    /// Captures provider-specific fields (e.g. `extra_content`).
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, Value>,
+}
+
+/// Function name + serialised arguments inside a [`ToolCall`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FunctionCall {
+    name: String,
+    arguments: String,
+}
+
+/// Tool definition sent to the API.
+#[derive(Debug, Clone, Serialize)]
+struct ToolDef {
+    r#type: String,
+    function: FunctionDef,
+}
+
+/// Function schema inside a [`ToolDef`].
+#[derive(Debug, Clone, Serialize)]
+struct FunctionDef {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+/// The top-level chat completion request body.
+#[derive(Debug, Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    tools: Vec<ToolDef>,
+    max_tokens: u32,
+}
+
+/// Parsed chat completion response (ignores unknown fields like Gemini's `extra_content`).
+#[derive(Debug, Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+/// A single choice in the response.
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+/// Token usage counters.
+#[derive(Debug, Deserialize)]
+struct UsageInfo {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 /// The core agentic engine.
 ///
-/// Owns an LLM client, a set of [`Tool`] implementations, and a
+/// Owns an HTTP client, a set of [`Tool`] implementations, and a
 /// [`CostTracker`]. The main entry point is [`QueryEngine::query`],
 /// which drives the tool-use loop until the LLM produces a final text
 /// response.
+///
+/// Uses raw `reqwest` + `serde_json` instead of `async-openai` to
+/// tolerate non-standard fields (e.g. Gemini's `extra_content`).
 ///
 /// # Architecture
 ///
@@ -60,7 +153,9 @@ pub enum ModelProvider {
 ///     }
 /// ```
 pub struct QueryEngine {
-    client: Client<async_openai::config::OpenAIConfig>,
+    http: reqwest::Client,
+    api_url: String,
+    api_key: String,
     model: String,
     pub tools: Vec<Box<dyn Tool + Send + Sync>>,
     config: EngineConfig,
@@ -70,26 +165,29 @@ pub struct QueryEngine {
 impl QueryEngine {
     /// Creates a new engine for the given model and provider.
     ///
+    /// The `api_key` is used for all providers. If `api_base` is `Some`,
+    /// it overrides the provider's default base URL (useful for proxies
+    /// or custom OpenAI-compatible endpoints).
+    ///
     /// Automatically registers all built-in tools:
     /// [`ReadFileTool`], [`WriteFileTool`], [`FileEditTool`],
     /// [`BashTool`], [`GlobTool`], [`GrepTool`].
-    ///
-    /// # Panics
-    ///
-    /// Does **not** panic. Missing `GEMINI_API_KEY` env var silently
-    /// defaults to an empty string (API calls will fail at runtime).
-    pub fn new(model: impl Into<String>, provider: ModelProvider, config: EngineConfig) -> Self {
-        let api_config = match provider {
-            ModelProvider::OpenAI => {
-                async_openai::config::OpenAIConfig::default()
-            }
+    pub fn new(
+        model: impl Into<String>,
+        provider: ModelProvider,
+        config: EngineConfig,
+        api_key: String,
+        api_base: Option<String>,
+    ) -> Self {
+        let base = api_base.unwrap_or_else(|| match provider {
+            ModelProvider::OpenAI => "https://api.openai.com/v1".to_string(),
             ModelProvider::Gemini => {
-                let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_else(|_| "".to_string());
-                async_openai::config::OpenAIConfig::default()
-                    .with_api_key(api_key)
-                    .with_api_base("https://generativelanguage.googleapis.com/v1beta/openai/")
+                "https://generativelanguage.googleapis.com/v1beta/openai".to_string()
             }
-        };
+            ModelProvider::OpenRouter => "https://openrouter.ai/api/v1".to_string(),
+        });
+
+        let api_url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
         let tools: Vec<Box<dyn Tool + Send + Sync>> = vec![
             Box::new(ReadFileTool),
@@ -101,7 +199,9 @@ impl QueryEngine {
         ];
 
         Self {
-            client: Client::with_config(api_config),
+            http: reqwest::Client::new(),
+            api_url,
+            api_key,
             model: model.into(),
             tools,
             config,
@@ -109,29 +209,19 @@ impl QueryEngine {
         }
     }
 
-    /// Converts registered [`Tool`]s into the OpenAI function-calling schema.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if any tool's schema fails to build via the
-    /// `async_openai` builder API.
-    fn get_openai_tools(&self) -> Result<Vec<ChatCompletionTool>> {
-        let mut ret = Vec::new();
-        for tool in &self.tools {
-            let func = FunctionObjectArgs::default()
-                .name(tool.name())
-                .description(tool.description())
-                .parameters(tool.input_schema())
-                .build()?;
-
-            ret.push(
-                ChatCompletionToolArgs::default()
-                    .r#type(ChatCompletionToolType::Function)
-                    .function(func)
-                    .build()?
-            );
-        }
-        Ok(ret)
+    /// Builds the tool definitions array for the API request.
+    fn build_tool_defs(&self) -> Vec<ToolDef> {
+        self.tools
+            .iter()
+            .map(|t| ToolDef {
+                r#type: "function".to_string(),
+                function: FunctionDef {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    parameters: t.input_schema(),
+                },
+            })
+            .collect()
     }
 
     /// Runs the agentic tool-use loop until the LLM produces a final text answer.
@@ -149,8 +239,12 @@ impl QueryEngine {
     ///
     /// Returns `Err` on network failures, malformed API responses,
     /// or if the LLM returns zero choices.
-    pub async fn query(&self, input: &str, tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>) -> Result<String> {
-        info!("Sending query to OpenAI model: {}", self.model);
+    pub async fn query(
+        &self,
+        input: &str,
+        tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+    ) -> Result<String> {
+        info!("Sending query to model: {} at {}", self.model, self.api_url);
 
         // Build system prompt: memory instructions + output styles
         let mut system_prompt = crate::mem::build_memory_prompt();
@@ -158,66 +252,105 @@ impl QueryEngine {
         system_prompt.push_str(&output_styles);
 
         // Initial conversation: system + user messages
-        let mut messages: Vec<ChatCompletionRequestMessage> = vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content(system_prompt)
-                .build()?
-                .into(),
-            ChatCompletionRequestUserMessageArgs::default()
-                .content(input)
-                .build()?
-                .into()
+        let mut messages: Vec<ChatMessage> = vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some(system_prompt),
+                tool_calls: None,
+                tool_call_id: None,
+                extra: Default::default(),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some(input.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                extra: Default::default(),
+            },
         ];
 
-        let openai_tools = self.get_openai_tools()?;
+        let tool_defs = self.build_tool_defs();
 
         let ctx = ToolContext {
             auto_mode: self.config.auto_mode,
             debug: false,
             tools_available: self.tools.iter().map(|t| t.name().to_string()).collect(),
-            max_budget_usd: None
+            max_budget_usd: None,
         };
 
         // === Agentic tool-use loop ===
         // Send → inspect → dispatch tools → append results → repeat
         loop {
-            let req = CreateChatCompletionRequestArgs::default()
-                .max_tokens(8192u16)
-                .model(&self.model)
-                .messages(messages.clone())
-                .tools(openai_tools.clone())
-                .build()
-                .context("Failed to construct Chat Request")?;
+            let body = ChatRequest {
+                model: self.model.clone(),
+                messages: messages.clone(),
+                tools: tool_defs.clone(),
+                max_tokens: 8192,
+            };
 
             let api_start = Instant::now();
-            let response = self.client.chat().create(req).await?;
+
+            let resp = self
+                .http
+                .post(&self.api_url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .context("API request failed — check your network connection")?;
+
+            let status = resp.status();
+            let resp_text = resp
+                .text()
+                .await
+                .context("Failed to read API response body")?;
+
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "API returned HTTP {} — check your API_KEY and PROVIDER.\nResponse: {}",
+                    status,
+                    resp_text
+                ));
+            }
+
+            let response: ChatResponse = serde_json::from_str(&resp_text).context(format!(
+                "Failed to parse API response. Raw response:\n{}",
+                &resp_text[..resp_text.len().min(500)]
+            ))?;
+
             let api_duration = api_start.elapsed().as_millis() as u64;
 
             // Track token usage
             if let Some(ref usage) = response.usage {
-                let input_tokens = usage.prompt_tokens as u64;
-                let output_tokens = usage.completion_tokens as u64;
                 if let Ok(mut tracker) = self.cost_tracker.lock() {
                     tracker.total_api_duration_ms += api_duration;
-                    tracker.add_usage(&self.model, input_tokens, output_tokens, 0.0);
+                    tracker.add_usage(
+                        &self.model,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        0.0,
+                    );
                 }
             }
 
-            let choice = response.choices.first().ok_or_else(|| anyhow!("No choices returned"))?;
-            let message = &choice.message;
+            let choice = response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("No choices returned"))?;
+
+            let assistant_msg = choice.message;
 
             // Append assistant turn to history
-            let mut asst_msg = ChatCompletionRequestAssistantMessageArgs::default();
-            if let Some(ref content) = message.content {
-                asst_msg.content(content.clone());
-            }
-            if let Some(ref tool_calls) = message.tool_calls {
-                asst_msg.tool_calls(tool_calls.clone());
-            }
-            messages.push(asst_msg.build()?.into());
+            messages.push(assistant_msg.clone());
 
             // Dispatch tool calls, or return final text
-            if let Some(ref tool_calls) = message.tool_calls {
+            if let Some(ref tool_calls) = assistant_msg.tool_calls {
+                if tool_calls.is_empty() {
+                    return Ok(assistant_msg.content.unwrap_or_default());
+                }
+
                 for call in tool_calls {
                     let func_name = &call.function.name;
                     let func_args = &call.function.arguments;
@@ -228,7 +361,11 @@ impl QueryEngine {
                             info!("Executing tool: {} with args: {}", func_name, func_args);
 
                             if let Some(ref tx) = tx_ui {
-                                let _ = tx.send(crate::ui::app::UiEvent::ToolStarted(func_name.to_string())).await;
+                                let _ = tx
+                                    .send(crate::ui::app::UiEvent::ToolStarted(
+                                        func_name.to_string(),
+                                    ))
+                                    .await;
                             }
 
                             let args_val: Value = serde_json::from_str(func_args)?;
@@ -242,39 +379,44 @@ impl QueryEngine {
                             }
 
                             if let Some(ref tx) = tx_ui {
-                                let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(func_name.to_string())).await;
+                                let _ = tx
+                                    .send(crate::ui::app::UiEvent::ToolFinished(
+                                        func_name.to_string(),
+                                    ))
+                                    .await;
                             }
 
                             let content = match exec_result {
-                                Ok(res) => serde_json::to_string(&res.output).unwrap_or_else(|_| "success".to_string()),
-                                Err(e) => format!("Error executing tool: {}", e)
+                                Ok(res) => serde_json::to_string(&res.output)
+                                    .unwrap_or_else(|_| "success".to_string()),
+                                Err(e) => format!("Error executing tool: {}", e),
                             };
 
-                            messages.push(
-                                ChatCompletionRequestToolMessageArgs::default()
-                                    .tool_call_id(call.id.clone())
-                                    .content(content)
-                                    .build()?
-                                    .into()
-                            );
+                            messages.push(ChatMessage {
+                                role: "tool".into(),
+                                content: Some(content),
+                                tool_calls: None,
+                                tool_call_id: Some(call.id.clone()),
+                                extra: Default::default(),
+                            });
                             handled = true;
                             break;
                         }
                     }
 
                     if !handled {
-                        messages.push(
-                            ChatCompletionRequestToolMessageArgs::default()
-                                .tool_call_id(call.id.clone())
-                                .content(format!("Error: Tool '{}' not found.", func_name))
-                                .build()?
-                                .into()
-                        );
+                        messages.push(ChatMessage {
+                            role: "tool".into(),
+                            content: Some(format!("Error: Tool '{}' not found.", func_name)),
+                            tool_calls: None,
+                            tool_call_id: Some(call.id.clone()),
+                            extra: Default::default(),
+                        });
                     }
                 }
             } else {
                 // No tool calls → final answer
-                return Ok(message.content.clone().unwrap_or_default());
+                return Ok(assistant_msg.content.unwrap_or_default());
             }
         }
     }

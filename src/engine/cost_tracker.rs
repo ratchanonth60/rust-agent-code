@@ -27,7 +27,7 @@ pub struct ModelUsage {
 /// use rust_agent::engine::cost_tracker::CostTracker;
 ///
 /// let mut tracker = CostTracker::new();
-/// tracker.add_usage("gemini-2.5-pro", 100, 50, 0.001);
+/// tracker.add_usage("gemini-3-flash-preview", 100, 50, 0.001);
 /// assert_eq!(tracker.total_cost_usd, 0.001);
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -37,7 +37,7 @@ pub struct CostTracker {
     pub total_tool_duration_ms: u64,
     pub total_lines_added: u64,
     pub total_lines_removed: u64,
-    /// Usage breakdown keyed by model name (e.g. `"gemini-2.5-pro"`).
+    /// Usage breakdown keyed by model name (e.g. `"gemini-3-flash-preview"`).
     pub model_usage: HashMap<String, ModelUsage>,
 }
 

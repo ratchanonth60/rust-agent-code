@@ -29,13 +29,21 @@ struct Args {
     #[arg(long, default_value_t = false)]
     auto: bool,
 
-    /// Model to use (e.g. gemini-2.5-pro, gpt-4o, claude-sonnet-4-20250514)
-    #[arg(short, long, default_value = "gemini-2.5-pro")]
+    /// API key for the selected provider
+    #[arg(long, env = "API_KEY")]
+    api_key: Option<String>,
+
+    /// Model provider (gemini, openai, openrouter)
+    #[arg(short, long, env = "PROVIDER", default_value = "gemini")]
+    provider: String,
+
+    /// Model to use (e.g. gemini-3-flash-preview, gpt-4o)
+    #[arg(short, long, env = "MODEL", default_value = "gemini-3-flash-preview")]
     model: String,
 
-    /// Model provider
-    #[arg(short, long, default_value = "gemini")]
-    provider: String,
+    /// Override API base URL for custom OpenAI-compatible endpoints
+    #[arg(long, env = "API_BASE")]
+    api_base: Option<String>,
 }
 
 #[tokio::main]
@@ -57,10 +65,20 @@ async fn main() -> anyhow::Result<()> {
         info!("Running in bare mode.");
     }
 
+    let api_key = args.api_key.unwrap_or_default();
+    if api_key.is_empty() {
+        eprintln!("Error: API_KEY is required. Set it via --api-key flag or API_KEY env var.");
+        std::process::exit(1);
+    }
+
     let provider = match args.provider.to_lowercase().as_str() {
         "openai" => ModelProvider::OpenAI,
+        "openrouter" => ModelProvider::OpenRouter,
         "gemini" => ModelProvider::Gemini,
-        _ => ModelProvider::Gemini,
+        other => {
+            eprintln!("Unknown provider '{}'. Use: gemini, openai, openrouter", other);
+            std::process::exit(1);
+        }
     };
 
     // Initialize Query Engine with config
@@ -68,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         auto_mode: args.auto,
         bare_mode: args.bare,
     };
-    let engine = QueryEngine::new(&args.model, provider, config);
+    let engine = QueryEngine::new(&args.model, provider, config, api_key, args.api_base);
 
     if let Some(q) = args.query {
         info!("Received query: {}", q);
