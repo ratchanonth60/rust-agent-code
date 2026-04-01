@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::engine::{ModelProvider, QueryEngine, EngineConfig};
+use crate::engine::{ModelProvider, QueryEngine};
 
 /// Rust-based AI Agent CLI (ported from TypeScript)
 #[derive(Parser, Debug)]
@@ -21,7 +21,7 @@ struct Args {
     #[arg(short, long)]
     query: Option<String>,
 
-    /// Run in bare/simple mode (minimal UI chrome)
+    /// Run in bare/simple mode
     #[arg(long, default_value_t = false)]
     bare: bool,
 
@@ -29,21 +29,30 @@ struct Args {
     #[arg(long, default_value_t = false)]
     auto: bool,
 
-    /// API key for the selected provider
-    #[arg(long, env = "API_KEY")]
+    /// Provider backend to use
+    #[arg(long, value_enum, default_value_t = ModelProvider::Gemini)]
+    provider: ModelProvider,
+
+    /// Model name to use with the selected provider
+    #[arg(long)]
+    model: Option<String>,
+
+    /// API key override for selected provider
+    #[arg(long)]
     api_key: Option<String>,
 
-    /// Model provider (gemini, openai, openrouter)
-    #[arg(short, long, env = "PROVIDER", default_value = "gemini")]
-    provider: String,
-
-    /// Model to use (e.g. gemini-3-flash-preview, gpt-4o)
-    #[arg(short, long, env = "MODEL", default_value = "gemini-3-flash-preview")]
-    model: String,
-
-    /// Override API base URL for custom OpenAI-compatible endpoints
-    #[arg(long, env = "API_BASE")]
+    /// API base URL override for selected provider
+    #[arg(long)]
     api_base: Option<String>,
+}
+
+fn default_model(provider: ModelProvider) -> &'static str {
+    match provider {
+        ModelProvider::Gemini => "gemini-2.5-pro",
+        ModelProvider::OpenAI => "gpt-4o-mini",
+        ModelProvider::Claude => "claude-3-7-sonnet-latest",
+        ModelProvider::OpenAICompatible => "gpt-4o-mini",
+    }
 }
 
 #[tokio::main]
@@ -65,41 +74,29 @@ async fn main() -> anyhow::Result<()> {
         info!("Running in bare mode.");
     }
 
-    let api_key = args.api_key.unwrap_or_default();
-    if api_key.is_empty() {
-        eprintln!("Error: API_KEY is required. Set it via --api-key flag or API_KEY env var.");
-        std::process::exit(1);
-    }
+    let selected_model = args
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model(args.provider).to_string());
+    info!(
+        "Using provider {:?} with model {}",
+        args.provider, selected_model
+    );
 
-    let provider = match args.provider.to_lowercase().as_str() {
-        "openai" => ModelProvider::OpenAI,
-        "openrouter" => ModelProvider::OpenRouter,
-        "gemini" => ModelProvider::Gemini,
-        other => {
-            eprintln!("Unknown provider '{}'. Use: gemini, openai, openrouter", other);
-            std::process::exit(1);
-        }
-    };
-
-    // Initialize Query Engine with config
-    let config = EngineConfig {
-        auto_mode: args.auto,
-        bare_mode: args.bare,
-    };
-    let engine = QueryEngine::new(&args.model, provider, config, api_key, args.api_base);
+    let engine = QueryEngine::new(
+        selected_model,
+        args.provider,
+        args.api_key.clone(),
+        args.api_base.clone(),
+    )?;
 
     if let Some(q) = args.query {
         info!("Received query: {}", q);
         let result = engine.query(&q, None).await;
-
+        
         match result {
             Ok(res) => println!("\n🤖 Agent says:\n{}", res),
             Err(e) => eprintln!("Error querying AI: {:?}", e),
-        }
-
-        // Print cost summary
-        if let Ok(tracker) = engine.cost_tracker.lock() {
-            eprintln!("\n{}", tracker.format_total_cost());
         }
     } else {
         info!("No query provided. Starting interactive UI...");
