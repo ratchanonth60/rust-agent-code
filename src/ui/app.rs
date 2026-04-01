@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout},
@@ -12,13 +12,19 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+/// Events sent from the engine background task to the TUI for rendering.
 pub enum UiEvent {
+    /// The LLM produced a final text response.
     LLMResponse(String),
+    /// The LLM call failed with an error message.
     LLMError(String),
+    /// A tool execution has started (carries the tool name).
     ToolStarted(String),
+    /// A tool execution has finished (carries the tool name).
     ToolFinished(String),
 }
 
+/// The interactive TUI application state, managing input, messages, and channel I/O.
 pub struct App {
     pub input: String,
     pub messages: Vec<String>,
@@ -27,10 +33,17 @@ pub struct App {
     pub frame_ticker: usize,
     tx_to_engine: mpsc::Sender<String>,
     rx_from_engine: mpsc::Receiver<UiEvent>,
+    /// Loaded keybindings (defaults + user overrides).
+    bindings: Vec<crate::keybindings::ParsedBinding>,
 }
 
 impl App {
+    /// Creates a new App with the given engine communication channels.
     pub fn new(tx_to_engine: mpsc::Sender<String>, rx_from_engine: mpsc::Receiver<UiEvent>) -> Self {
+        let load_result = crate::keybindings::load_keybindings();
+        if !load_result.warnings.is_empty() {
+            tracing::warn!("Keybinding warnings: {:?}", load_result.warnings);
+        }
         Self {
             input: String::new(),
             messages: vec![
@@ -42,9 +55,11 @@ impl App {
             frame_ticker: 0,
             tx_to_engine,
             rx_from_engine,
+            bindings: load_result.bindings,
         }
     }
 
+    /// Runs the main TUI event loop: draws frames, polls engine events, and handles keyboard input.
     pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         while !self.exit {
             // Draw UI
@@ -63,9 +78,17 @@ impl App {
             // Process terminal input events (non-blocking interval 100ms)
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    // Route via new Keybinding system first
-                    if let Some(action) = crate::keybindings::resolve_key_event(key) {
-                        use crate::keybindings::KeybindingAction;
+                    // Route via keybinding system
+                    use crate::keybindings::{resolve_key, KeybindingAction, KeybindingContext};
+                    let active_contexts = vec![
+                        KeybindingContext::Global,
+                        KeybindingContext::Chat,
+                    ];
+                    if let Some(action) = resolve_key(
+                        &key,
+                        &active_contexts,
+                        &self.bindings,
+                    ) {
                         match action {
                             KeybindingAction::AppInterrupt | KeybindingAction::AppExit => {
                                 self.exit = true;
@@ -79,7 +102,7 @@ impl App {
                                     self.exit = true;
                                 } else if !submitted.is_empty() {
                                     self.messages.push(format!("🧑 You: {}", submitted));
-                                    
+
                                     // Send query to engine thread
                                     let _ = self.tx_to_engine.send(submitted).await;
                                     self.input.clear();
@@ -88,11 +111,14 @@ impl App {
                             KeybindingAction::ChatCancel => {
                                 self.input.clear(); // Clear input
                             }
-                            KeybindingAction::HistoryPrev => {
+                            KeybindingAction::HistoryPrevious => {
                                 // Previous command history
                             }
                             KeybindingAction::HistoryNext => {
                                 // Next command history
+                            }
+                            _ => {
+                                // Other actions not yet handled in the TUI
                             }
                         }
                     } else {
@@ -116,6 +142,7 @@ impl App {
         Ok(())
     }
 
+    /// Renders the two-panel layout: scrollable conversation history on top, input prompt on bottom.
     fn ui(&self, f: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)

@@ -1,9 +1,9 @@
 use glob::glob;
 use regex::Regex;
 use std::fs;
-use std::path::PathBuf;
 use tracing::warn;
 
+/// A single loaded output style definition.
 pub struct OutputStyle {
     pub name: String,
     pub prompt: String,

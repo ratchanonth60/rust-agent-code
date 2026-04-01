@@ -4,7 +4,7 @@
 /// on how to manage its memory. The LLM persistence operates via a virtual RAG over the
 /// file system, indexing into `MEMORY.md`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Get the path to the current agent's local memory directory
 pub fn get_auto_mem_path() -> PathBuf {
@@ -19,7 +19,7 @@ pub fn build_memory_prompt() -> String {
     let memory_dir = get_auto_mem_path();
     let dir_str = memory_dir.to_string_lossy();
 
-    format!(
+    let mut prompt = format!(
         "You are a helpful AI Agent operating in the local system.
 You can execute bash commands and read/write files.
 
@@ -35,5 +35,16 @@ Saving a memory is a two-step process:
 
 Use the ReadFile and WriteFile tools to access and evolve this structure.",
         dir_str
-    )
+    );
+
+    // Inject existing memory content directly if present
+    let memory_file = memory_dir.join("MEMORY.md");
+    if memory_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&memory_file) {
+            prompt.push_str("\n\n# Your Current Memories\n");
+            prompt.push_str(&content);
+        }
+    }
+
+    prompt
 }

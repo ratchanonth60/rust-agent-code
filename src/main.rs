@@ -7,12 +7,11 @@ pub mod keybindings;
 pub mod output_styles;
 
 use clap::Parser;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::engine::{ModelProvider, QueryEngine};
+use crate::engine::{ModelProvider, QueryEngine, EngineConfig};
 
 /// Rust-based AI Agent CLI (ported from TypeScript)
 #[derive(Parser, Debug)]
@@ -22,13 +21,21 @@ struct Args {
     #[arg(short, long)]
     query: Option<String>,
 
-    /// Run in bare/simple mode
+    /// Run in bare/simple mode (minimal UI chrome)
     #[arg(long, default_value_t = false)]
     bare: bool,
 
     /// Automatically run commands and bypass permission prompts [Y/n]
     #[arg(long, default_value_t = false)]
     auto: bool,
+
+    /// Model to use (e.g. gemini-2.5-pro, gpt-4o, claude-sonnet-4-20250514)
+    #[arg(short, long, default_value = "gemini-2.5-pro")]
+    model: String,
+
+    /// Model provider
+    #[arg(short, long, default_value = "gemini")]
+    provider: String,
 }
 
 #[tokio::main]
@@ -50,16 +57,31 @@ async fn main() -> anyhow::Result<()> {
         info!("Running in bare mode.");
     }
 
-    // Initialize Query Engine. E.g., using Gemini
-    let engine = QueryEngine::new("gemini-2.5-pro", ModelProvider::Gemini);
+    let provider = match args.provider.to_lowercase().as_str() {
+        "openai" => ModelProvider::OpenAI,
+        "gemini" => ModelProvider::Gemini,
+        _ => ModelProvider::Gemini,
+    };
+
+    // Initialize Query Engine with config
+    let config = EngineConfig {
+        auto_mode: args.auto,
+        bare_mode: args.bare,
+    };
+    let engine = QueryEngine::new(&args.model, provider, config);
 
     if let Some(q) = args.query {
         info!("Received query: {}", q);
         let result = engine.query(&q, None).await;
-        
+
         match result {
             Ok(res) => println!("\n🤖 Agent says:\n{}", res),
             Err(e) => eprintln!("Error querying AI: {:?}", e),
+        }
+
+        // Print cost summary
+        if let Ok(tracker) = engine.cost_tracker.lock() {
+            eprintln!("\n{}", tracker.format_total_cost());
         }
     } else {
         info!("No query provided. Starting interactive UI...");

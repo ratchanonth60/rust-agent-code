@@ -6,20 +6,26 @@ use std::path::Path;
 
 use crate::tools::{Tool, ToolContext, ToolResult};
 
+/// Deserialized input for [`WriteFileTool`].
 #[derive(Deserialize)]
 pub struct WriteFileInput {
+    /// Target file path.
     pub path: String,
+    /// Text content to write.
     pub content: String,
+    /// Must be `true` to overwrite an existing file.
     pub overwrite: Option<bool>,
 }
 
+/// Writes text content to a file, creating parent directories as needed.
+///
+/// Refuses to overwrite an existing file unless `overwrite` is explicitly
+/// set to `true`, preventing accidental data loss.
 pub struct WriteFileTool;
 
 #[async_trait]
 impl Tool for WriteFileTool {
-    fn name(&self) -> &str {
-        "write_file"
-    }
+    fn name(&self) -> &str { "write_file" }
 
     fn description(&self) -> &str {
         "Write text content to a file at a specified path. Use overwrite=true to replace an existing file."
@@ -46,6 +52,14 @@ impl Tool for WriteFileTool {
         })
     }
 
+    /// Writes `content` to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ToolResult::err` (not a hard error) when:
+    /// - The file already exists and `overwrite` is not `true`.
+    /// - Parent directory creation fails.
+    /// - The write itself fails (permissions, disk full, etc.).
     async fn call(&self, input: Value, _context: &ToolContext) -> anyhow::Result<ToolResult> {
         let params: WriteFileInput = serde_json::from_value(input)?;
         let file_path = Path::new(&params.path);
@@ -77,7 +91,5 @@ impl Tool for WriteFileTool {
         }
     }
 
-    fn is_destructive(&self) -> bool {
-        true
-    }
+    fn is_destructive(&self) -> bool { true }
 }

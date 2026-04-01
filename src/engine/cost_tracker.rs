@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
+/// Per-model token and cost breakdown.
+///
+/// One instance exists per model name inside [`CostTracker::model_usage`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelUsage {
     pub input_tokens: u64,
@@ -13,6 +16,20 @@ pub struct ModelUsage {
     pub max_output_tokens: u64,
 }
 
+/// Accumulates API costs, token counts, and timing for the whole session.
+///
+/// Thread-safe access is provided by wrapping this struct in a
+/// [`std::sync::Mutex`] inside [`QueryEngine`](crate::engine::QueryEngine).
+///
+/// # Examples
+///
+/// ```
+/// use rust_agent::engine::cost_tracker::CostTracker;
+///
+/// let mut tracker = CostTracker::new();
+/// tracker.add_usage("gemini-2.5-pro", 100, 50, 0.001);
+/// assert_eq!(tracker.total_cost_usd, 0.001);
+/// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostTracker {
     pub total_cost_usd: f64,
@@ -20,17 +37,20 @@ pub struct CostTracker {
     pub total_tool_duration_ms: u64,
     pub total_lines_added: u64,
     pub total_lines_removed: u64,
-    
-    // Usage mapped by Model shortname
+    /// Usage breakdown keyed by model name (e.g. `"gemini-2.5-pro"`).
     pub model_usage: HashMap<String, ModelUsage>,
 }
 
 impl CostTracker {
+    /// Creates a zeroed-out tracker.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Add exact usage from an API call
+    /// Records token usage and cost from a single API call.
+    ///
+    /// Accumulates into both the per-model [`ModelUsage`] entry and the
+    /// session-wide `total_cost_usd`.
     pub fn add_usage(&mut self, model: &str, input_tokens: u64, output_tokens: u64, cost: f64) {
         let usage = self.model_usage.entry(model.to_string()).or_default();
         usage.input_tokens += input_tokens;
@@ -39,7 +59,9 @@ impl CostTracker {
         self.total_cost_usd += cost;
     }
 
-    /// Renders a terminal-friendly summary of the cost exactly like the TS `formatTotalCost`
+    /// Renders a terminal-friendly cost summary.
+    ///
+    /// Output format mirrors the TypeScript `formatTotalCost()` helper.
     pub fn format_total_cost(&self) -> String {
         let mut result = format!(
             "Total cost:            ${:.4}\n\

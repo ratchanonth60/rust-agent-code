@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-/// TaskType defines the environment or mode the agent operates within.
+/// The environment or execution mode an agent task operates within.
+///
+/// Maps 1-to-1 with the TypeScript `TaskType` union.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
@@ -13,7 +15,10 @@ pub enum TaskType {
     Dream,
 }
 
-/// The lifecycle status of a task.
+/// Lifecycle status of an agent task.
+///
+/// A task progresses from [`Pending`](Self::Pending) →
+/// [`Running`](Self::Running) → one of the terminal states.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -25,12 +30,24 @@ pub enum TaskStatus {
 }
 
 impl TaskStatus {
+    /// Returns `true` when no further state transitions are possible.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rust_agent::models::TaskStatus;
+    /// assert!(TaskStatus::Completed.is_terminal());
+    /// assert!(!TaskStatus::Running.is_terminal());
+    /// ```
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Killed)
     }
 }
 
-/// Base representation of a Task state
+/// Base representation of an agent task's state.
+///
+/// Mirrors the TypeScript `TaskStateBase` interface. Currently declared
+/// for forward-compatibility; not yet wired into the runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskStateBase {
     pub id: String,
@@ -46,7 +63,7 @@ pub struct TaskStateBase {
     pub notified: bool,
 }
 
-/// Represents different roles corresponding to AI interactions
+/// Participant role in a conversation turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -55,7 +72,15 @@ pub enum Role {
     System,
 }
 
-/// Core Message definition mimicking the TS Message interface
+/// A single message in the conversation history.
+///
+/// # Examples
+///
+/// ```
+/// use rust_agent::models::Message;
+/// let msg = Message::new_user("hello");
+/// assert_eq!(msg.content, "hello");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -63,16 +88,18 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
 }
 
+/// A file or data blob attached to a [`Message`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attachment {
     #[serde(rename = "type")]
     pub attachment_type: String,
     pub name: String,
-    pub species: Option<String>, 
+    pub species: Option<String>,
     pub file_path: Option<String>,
 }
 
 impl Message {
+    /// Creates a [`Role::User`] message with empty attachments.
     pub fn new_user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
@@ -80,7 +107,8 @@ impl Message {
             attachments: vec![],
         }
     }
-    
+
+    /// Creates a [`Role::System`] message with empty attachments.
     pub fn new_system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,

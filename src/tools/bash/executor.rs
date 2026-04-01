@@ -9,19 +9,24 @@ use tokio::time::timeout;
 
 use crate::tools::{Tool, ToolContext, ToolResult};
 
+/// Deserialized input for [`BashTool`].
 #[derive(Deserialize)]
 pub struct BashInput {
+    /// The shell command string to execute.
     pub command: String,
+    /// Optional timeout in ms; defaults to 300 000 (5 min).
     pub timeout_ms: Option<u64>,
 }
 
+/// Executes arbitrary shell commands via `bash -c` with a configurable timeout.
+///
+/// Returns JSON containing `stdout`, `stderr`, and `exit_code`.
+/// On timeout the child process is killed and an error result is returned.
 pub struct BashTool;
 
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> &str {
-        "bash"
-    }
+    fn name(&self) -> &str { "bash" }
 
     fn description(&self) -> &str {
         "Execute a bash command on the local machine. Use this to run shell scripts, compilers, search tools, etc. Provide the exact string of the command to execute."
@@ -44,6 +49,13 @@ impl Tool for BashTool {
         })
     }
 
+    /// Spawns `bash -c <command>`, waits with timeout, and collects output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the child process cannot be spawned (e.g. `bash`
+    /// not found). Non-zero exit codes are returned as
+    /// `Ok(ToolResult::err(...))` — they are not hard errors.
     async fn call(&self, input: Value, _context: &ToolContext) -> anyhow::Result<ToolResult> {
         let params: BashInput = serde_json::from_value(input)?;
 
@@ -55,9 +67,8 @@ impl Tool for BashTool {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn bash: {}", e))?;
 
-        let timeout_duration = Duration::from_millis(params.timeout_ms.unwrap_or(300_000)); // Default 5 mins
+        let timeout_duration = Duration::from_millis(params.timeout_ms.unwrap_or(300_000));
 
-        // Wait for the process with a timeout
         let result = match timeout(timeout_duration, child.wait()).await {
             Ok(status_res) => status_res,
             Err(_) => {
@@ -101,7 +112,5 @@ impl Tool for BashTool {
         }
     }
 
-    fn is_destructive(&self) -> bool {
-        true
-    }
+    fn is_destructive(&self) -> bool { true }
 }
