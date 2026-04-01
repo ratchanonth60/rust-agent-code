@@ -60,7 +60,7 @@ cargo run -- --auto --query "create hello.txt"
 | Flag | Description | Default |
 |---|---|---|
 | `-q, --query <TEXT>` | One-shot query (skips TUI) | — |
-| `-m, --model <NAME>` | Model name | `gemini-2.5-pro` |
+| `-m, --model <NAME>` | Model name | `gemini-3-flash-preview` |
 | `-p, --provider <NAME>` | `gemini` or `openai` | `gemini` |
 | `--auto` | Skip permission prompts | `false` |
 | `--bare` | Minimal UI | `false` |
