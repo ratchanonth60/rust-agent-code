@@ -155,6 +155,26 @@ impl QueryEngine {
         })
     }
 
+    /// Register an [`AgentTool`] that can spawn sub-agents with this engine's
+    /// model and configuration.  Sub-agents do **not** inherit the AgentTool,
+    /// preventing infinite recursion.
+    ///
+    /// Follows a builder pattern so it can be chained after [`QueryEngine::new`]:
+    ///
+    /// ```ignore
+    /// let engine = QueryEngine::new(model, provider, None, None, config)?
+    ///     .with_agent_tool();
+    /// ```
+    pub fn with_agent_tool(mut self) -> Self {
+        use crate::engine::agent_tool::AgentTool;
+        self.tools.push(Box::new(AgentTool::new(
+            self.model.clone(),
+            self.provider,
+            self.config.clone(),
+        )));
+        self
+    }
+
     /// Converts registered tools into the OpenAI function-calling schema.
     fn get_openai_tools(&self) -> Result<Vec<ChatCompletionTool>> {
         let mut ret = Vec::new();
