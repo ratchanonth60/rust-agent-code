@@ -10,9 +10,18 @@ use clap::ValueEnum;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tracing::info;
 
-use crate::tools::{fs::ReadFileTool, fs::WriteFileTool, bash::BashTool, Tool, ToolContext};
+use crate::engine::config::EngineConfig;
+use crate::engine::cost_tracker::CostTracker;
+use crate::permissions::{PermissionDecision, PermissionRule, check_permission};
+use crate::tools::{
+    fs::ReadFileTool, fs::WriteFileTool, bash::BashTool,
+    edit::FileEditTool, glob_tool::GlobTool, grep_tool::GrepTool,
+    Tool, ToolContext,
+};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ModelProvider {
@@ -28,6 +37,12 @@ pub struct QueryEngine {
     http_client: reqwest::Client,
     model: String,
     pub tools: Vec<Box<dyn Tool + Send + Sync>>,
+    pub config: EngineConfig,
+    pub cost_tracker: Arc<Mutex<CostTracker>>,
+    /// Session permission rules (e.g. "always allow" decisions).
+    pub permission_rules: Arc<Mutex<Vec<PermissionRule>>>,
+    /// Working directory for path safety checks.
+    pub cwd: std::path::PathBuf,
 }
 
 impl QueryEngine {
@@ -37,6 +52,7 @@ impl QueryEngine {
         provider: ModelProvider,
         api_key: Option<String>,
         api_base: Option<String>,
+        config: EngineConfig,
     ) -> Result<Self> {
         let openai_client = match provider {
             ModelProvider::Claude => None,
@@ -82,6 +98,9 @@ impl QueryEngine {
             Box::new(ReadFileTool),
             Box::new(WriteFileTool),
             Box::new(BashTool),
+            Box::new(FileEditTool),
+            Box::new(GlobTool),
+            Box::new(GrepTool),
         ];
 
         Ok(Self {
@@ -90,6 +109,10 @@ impl QueryEngine {
             http_client: reqwest::Client::new(),
             model: model.into(),
             tools,
+            config,
+            cost_tracker: Arc::new(Mutex::new(CostTracker::new())),
+            permission_rules: Arc::new(Mutex::new(Vec::new())),
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         })
     }
 
@@ -129,6 +152,73 @@ impl QueryEngine {
         })
     }
 
+    /// Check permission for a tool invocation. Returns Ok(true) if allowed, Ok(false) if denied.
+    /// When the decision is Ask and a TUI channel is available, sends a PermissionRequest and waits
+    /// for the user's response.
+    async fn check_tool_permission(
+        &self,
+        tool: &(dyn Tool + Send + Sync),
+        input: &Value,
+        tx_ui: &Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+    ) -> Result<bool> {
+        let rules = self.permission_rules.lock()
+            .map(|r| r.clone())
+            .unwrap_or_default();
+
+        let decision = check_permission(
+            tool,
+            input,
+            self.config.permission_mode,
+            &self.cwd,
+            &rules,
+        );
+
+        match decision {
+            PermissionDecision::Allow => Ok(true),
+            PermissionDecision::Deny { reason } => {
+                info!("Permission denied for '{}': {}", tool.name(), reason);
+                Ok(false)
+            }
+            PermissionDecision::Ask { tool_name, description } => {
+                // In auto mode or bypass mode, allow
+                if self.config.auto_mode {
+                    return Ok(true);
+                }
+
+                // If we have a TUI channel, ask the user
+                if let Some(ref tx) = tx_ui {
+                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(crate::ui::app::UiEvent::PermissionRequest {
+                        tool_name: tool_name.clone(),
+                        description,
+                        response_tx: resp_tx,
+                    }).await;
+
+                    match resp_rx.await {
+                        Ok(crate::ui::app::PermissionResponse::Allow) => Ok(true),
+                        Ok(crate::ui::app::PermissionResponse::AlwaysAllow) => {
+                            // Add a permanent allow rule for this tool
+                            if let Ok(mut rules) = self.permission_rules.lock() {
+                                rules.push(PermissionRule {
+                                    tool_name,
+                                    pattern: None,
+                                    behavior: crate::permissions::RuleBehavior::Allow,
+                                });
+                            }
+                            Ok(true)
+                        }
+                        Ok(crate::ui::app::PermissionResponse::Deny) => Ok(false),
+                        Err(_) => Ok(false), // Channel closed = deny
+                    }
+                } else {
+                    // No TUI (bare/one-shot mode): deny by default for non-auto
+                    info!("No TUI available for permission prompt, denying '{}'", tool_name);
+                    Ok(false)
+                }
+            }
+        }
+    }
+
     /// Executes the agent loop. It will call LLM, if tools are requested, it executes them and loops.
     pub async fn query(&self, input: &str, tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>) -> Result<String> {
         info!("Sending query to {:?} model: {}", self.provider, self.model);
@@ -142,17 +232,21 @@ impl QueryEngine {
         let output_styles = crate::output_styles::build_styles_prompt();
         system_prompt.push_str(&output_styles);
         
-        // 3. Setup ToolContext - later this will be driven by CLI args like --auto
-        let ctx = ToolContext { 
-            auto_mode: true, 
-            debug: false, 
-            tools_available: vec![], 
-            max_budget_usd: None 
-        }; // Hardcoded auto-mode for Phase 5 MVP
+        // 3. Setup ToolContext driven by EngineConfig
+        let tool_names = self.tools.iter().map(|t| t.name().to_string()).collect();
+        let ctx = ToolContext {
+            auto_mode: self.config.auto_mode,
+            debug: self.config.debug,
+            tools_available: tool_names,
+            max_budget_usd: self.config.max_budget_usd,
+        };
+
+        // Pre-compute context window for compaction
+        let context_window = crate::engine::tokens::get_context_window(&self.model);
 
         match self.provider {
-            ModelProvider::Claude => self.query_claude(input, &system_prompt, &ctx, tx_ui).await,
-            _ => self.query_openai_compatible(input, &system_prompt, &ctx, tx_ui).await,
+            ModelProvider::Claude => self.query_claude(input, &system_prompt, &ctx, tx_ui, context_window).await,
+            _ => self.query_openai_compatible(input, &system_prompt, &ctx, tx_ui, context_window).await,
         }
     }
 
@@ -162,6 +256,7 @@ impl QueryEngine {
         system_prompt: &str,
         ctx: &ToolContext,
         tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+        context_window: u64,
     ) -> Result<String> {
         let mut messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()
@@ -180,19 +275,55 @@ impl QueryEngine {
         // ============================================
         // 4. THE AGENTIC TOOL EVALUATION LOOP
         // ============================================
-        // We will constantly ask the Model for a response.
-        // If it asks to run Tools, we run them in Rust, append the results to the message list,
-        // and loop back to the LLM to get an analysis of the Tool's output!
         loop {
+            // Microcompact: clear old tool results if approaching context limit
+            {
+                let est_tokens = messages.iter()
+                    .map(|m| {
+                        let s = serde_json::to_string(m).unwrap_or_default();
+                        crate::engine::tokens::estimate_tokens(&s)
+                    })
+                    .sum::<u64>();
+                if crate::engine::tokens::should_compact(est_tokens, context_window, 0.8) {
+                    info!("Approaching context limit ({}/{} est. tokens), clearing old tool results", est_tokens, context_window);
+                    // For OpenAI, we serialize to JSON, microcompact, then deserialize back
+                    let mut json_msgs: Vec<Value> = messages.iter()
+                        .map(|m| serde_json::to_value(m).unwrap_or_default())
+                        .collect();
+                    crate::engine::compaction::microcompact_openai(&mut json_msgs, 6);
+                    // Re-serialize back (best-effort; if it fails, keep originals)
+                    let compacted: Vec<ChatCompletionRequestMessage> = json_msgs.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect();
+                    if compacted.len() == messages.len() {
+                        messages = compacted;
+                    }
+                }
+            }
+
             let req = CreateChatCompletionRequestArgs::default()
-                .max_tokens(1024u16)
+                .max_tokens(self.config.max_tokens as u16)
                 .model(&self.model)
                 .messages(messages.clone())
                 .tools(openai_tools.clone())
                 .build()
                 .context("Failed to construct Chat Request")?;
 
+            let api_start = Instant::now();
             let response = client.chat().create(req).await?;
+            let api_duration = api_start.elapsed().as_millis() as u64;
+
+            // Track usage/cost from OpenAI response
+            if let Some(ref usage) = response.usage {
+                let input_tok = usage.prompt_tokens as u64;
+                let output_tok = usage.completion_tokens as u64;
+                let cost = calculate_cost(&self.model, input_tok, output_tok);
+                if let Ok(mut tracker) = self.cost_tracker.lock() {
+                    tracker.add_usage(&self.model, input_tok, output_tok, cost);
+                    tracker.total_api_duration_ms += api_duration;
+                }
+            }
+
             let choice = response.choices.first().ok_or_else(|| anyhow!("No choices returned"))?;
             let message = &choice.message;
 
@@ -214,13 +345,27 @@ impl QueryEngine {
                     if let Some(tool) = self.find_tool(func_name) {
                         info!("Executing tool: {} with args: {}", func_name, func_args);
 
+                        let args_val: Value = serde_json::from_str(func_args)?;
+
+                        // Permission check
+                        let allowed = self.check_tool_permission(tool, &args_val, &tx_ui).await?;
+                        if !allowed {
+                            messages.push(
+                                ChatCompletionRequestToolMessageArgs::default()
+                                    .tool_call_id(call.id.clone())
+                                    .content(format!("Permission denied for tool '{}'.", func_name))
+                                    .build()?
+                                    .into()
+                            );
+                            continue;
+                        }
+
                         if let Some(ref tx) = tx_ui {
                             let _ = tx
                                 .send(crate::ui::app::UiEvent::ToolStarted(func_name.to_string()))
                                 .await;
                         }
 
-                        let args_val: Value = serde_json::from_str(func_args)?;
                         let exec_result = tool.call(args_val, ctx).await;
 
                         if let Some(ref tx) = tx_ui {
@@ -288,7 +433,10 @@ impl QueryEngine {
         system_prompt: &str,
         ctx: &ToolContext,
         tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+        context_window: u64,
     ) -> Result<String> {
+        use crate::engine::streaming::{parse_claude_sse, parse_tool_input, StreamEvent};
+
         let api_key = self.get_claude_key();
         if api_key.is_empty() {
             return Err(anyhow!(
@@ -305,11 +453,33 @@ impl QueryEngine {
         }];
 
         let tools = self.get_claude_tools();
+        let use_streaming = tx_ui.is_some(); // Stream when TUI is active
 
         loop {
+            // Microcompact: clear old tool results if approaching context limit
+            {
+                let mut json_msgs: Vec<Value> = messages.iter()
+                    .map(|m| serde_json::to_value(m).unwrap_or_default())
+                    .collect();
+                let est_tokens: u64 = json_msgs.iter()
+                    .map(|v| crate::engine::tokens::estimate_tokens(&v.to_string()))
+                    .sum();
+                if crate::engine::tokens::should_compact(est_tokens, context_window, 0.8) {
+                    info!("Approaching context limit ({}/{} est. tokens), clearing old tool results", est_tokens, context_window);
+                    crate::engine::compaction::microcompact(&mut json_msgs, 6);
+                    // Re-serialize back
+                    let compacted: Vec<ClaudeMessage> = json_msgs.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect();
+                    if compacted.len() == messages.len() {
+                        messages = compacted;
+                    }
+                }
+            }
+
             let request_body = ClaudeMessagesRequest {
                 model: self.model.clone(),
-                max_tokens: 1024,
+                max_tokens: self.config.max_tokens,
                 system: Some(system_prompt.to_string()),
                 messages: messages.clone(),
                 tools: if tools.is_empty() { None } else { Some(tools.clone()) },
@@ -320,6 +490,7 @@ impl QueryEngine {
                         r#type: "auto".to_string(),
                     })
                 },
+                stream: if use_streaming { Some(true) } else { None },
             };
 
             let mut headers = HeaderMap::new();
@@ -328,48 +499,118 @@ impl QueryEngine {
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
             let endpoint = format!("{}/v1/messages", api_base.trim_end_matches('/'));
+            let api_start = Instant::now();
             let response = self
                 .http_client
-                .post(endpoint)
+                .post(&endpoint)
                 .headers(headers)
                 .json(&request_body)
                 .send()
                 .await?;
+            let status = response.status();
 
-            if !response.status().is_success() {
-                let status = response.status();
+            if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
                 return Err(anyhow!("Claude API error {}: {}", status, body));
             }
 
-            let api_response: ClaudeMessagesResponse = response.json().await?;
-            messages.push(ClaudeMessage {
-                role: "assistant".to_string(),
-                content: api_response.content.clone(),
-            });
+            // ---- Streaming path ----
+            if use_streaming {
+                // Notify TUI that streaming started
+                if let Some(ref tx) = tx_ui {
+                    let _ = tx.send(crate::ui::app::UiEvent::StreamStart).await;
+                }
 
-            let mut tool_result_blocks = Vec::new();
-            for block in &api_response.content {
-                if let ClaudeContentBlock::ToolUse { id, name, input } = block {
-                    if let Some(tool) = self.find_tool(name) {
-                        if let Some(ref tx) = tx_ui {
-                            let _ = tx
-                                .send(crate::ui::app::UiEvent::ToolStarted(name.clone()))
-                                .await;
+                // Create a channel to forward stream events to the TUI
+                let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+
+                // Forward StreamEvent::TextDelta → UiEvent::StreamDelta in background
+                let tx_ui_clone = tx_ui.clone();
+                let forward_handle = tokio::spawn(async move {
+                    while let Some(event) = stream_rx.recv().await {
+                        if let Some(ref tx) = tx_ui_clone {
+                            match &event {
+                                StreamEvent::TextDelta(text) => {
+                                    let _ = tx.send(crate::ui::app::UiEvent::StreamDelta(text.clone())).await;
+                                }
+                                StreamEvent::ToolUseStart { name, .. } => {
+                                    let _ = tx.send(crate::ui::app::UiEvent::ToolStarted(name.clone())).await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+
+                let streamed = parse_claude_sse(response, Some(&stream_tx)).await;
+                drop(stream_tx); // Close channel so forward_handle finishes
+                let _ = forward_handle.await;
+
+                // Notify TUI that streaming ended
+                if let Some(ref tx) = tx_ui {
+                    let _ = tx.send(crate::ui::app::UiEvent::StreamEnd).await;
+                }
+
+                let streamed = streamed?;
+                let api_duration = api_start.elapsed().as_millis() as u64;
+
+                // Track cost
+                let cost = calculate_cost(&self.model, streamed.input_tokens, streamed.output_tokens);
+                if let Ok(mut tracker) = self.cost_tracker.lock() {
+                    tracker.add_usage(&self.model, streamed.input_tokens, streamed.output_tokens, cost);
+                    tracker.total_api_duration_ms += api_duration;
+                }
+
+                // Reconstruct assistant message content blocks
+                let mut assistant_content = Vec::new();
+                if !streamed.text.is_empty() {
+                    assistant_content.push(ClaudeContentBlock::Text {
+                        text: streamed.text.clone(),
+                    });
+                }
+                for tu in &streamed.tool_uses {
+                    assistant_content.push(ClaudeContentBlock::ToolUse {
+                        id: tu.id.clone(),
+                        name: tu.name.clone(),
+                        input: parse_tool_input(&tu.input_json),
+                    });
+                }
+
+                messages.push(ClaudeMessage {
+                    role: "assistant".to_string(),
+                    content: assistant_content,
+                });
+
+                // Execute tool calls if any
+                if streamed.tool_uses.is_empty() {
+                    return Ok(streamed.text);
+                }
+
+                let mut tool_result_blocks = Vec::new();
+                for tu in &streamed.tool_uses {
+                    let tool_input = parse_tool_input(&tu.input_json);
+                    if let Some(tool) = self.find_tool(&tu.name) {
+                        // Permission check
+                        let allowed = self.check_tool_permission(tool, &tool_input, &tx_ui).await?;
+                        if !allowed {
+                            tool_result_blocks.push(ClaudeContentBlock::ToolResult {
+                                tool_use_id: tu.id.clone(),
+                                content: format!("Permission denied for tool '{}'.", tu.name),
+                                is_error: Some(true),
+                            });
+                            continue;
                         }
 
-                        let exec_result = tool.call(input.clone(), ctx).await;
+                        let exec_result = tool.call(tool_input, ctx).await;
 
                         if let Some(ref tx) = tx_ui {
-                            let _ = tx
-                                .send(crate::ui::app::UiEvent::ToolFinished(name.clone()))
-                                .await;
+                            let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(tu.name.clone())).await;
                         }
 
                         match exec_result {
                             Ok(res) => {
                                 tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
+                                    tool_use_id: tu.id.clone(),
                                     content: serde_json::to_string(&res.output)
                                         .unwrap_or_else(|_| "{}".to_string()),
                                     is_error: if res.is_error { Some(true) } else { None },
@@ -377,7 +618,7 @@ impl QueryEngine {
                             }
                             Err(e) => {
                                 tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
+                                    tool_use_id: tu.id.clone(),
                                     content: format!("Error executing tool: {}", e),
                                     is_error: Some(true),
                                 });
@@ -385,32 +626,98 @@ impl QueryEngine {
                         }
                     } else {
                         tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: format!("Error: Tool '{}' not found.", name),
+                            tool_use_id: tu.id.clone(),
+                            content: format!("Error: Tool '{}' not found.", tu.name),
                             is_error: Some(true),
                         });
                     }
                 }
+
+                messages.push(ClaudeMessage {
+                    role: "user".to_string(),
+                    content: tool_result_blocks,
+                });
+
+            // ---- Non-streaming path (one-shot / bare mode) ----
+            } else {
+                let api_response: ClaudeMessagesResponse = response.json().await?;
+                let api_duration = api_start.elapsed().as_millis() as u64;
+
+                // Track cost
+                if let Some(ref usage) = api_response.usage {
+                    let cost = calculate_cost(&self.model, usage.input_tokens, usage.output_tokens);
+                    if let Ok(mut tracker) = self.cost_tracker.lock() {
+                        tracker.add_usage(&self.model, usage.input_tokens, usage.output_tokens, cost);
+                        tracker.total_api_duration_ms += api_duration;
+                    }
+                }
+
+                messages.push(ClaudeMessage {
+                    role: "assistant".to_string(),
+                    content: api_response.content.clone(),
+                });
+
+                let mut tool_result_blocks = Vec::new();
+                for block in &api_response.content {
+                    if let ClaudeContentBlock::ToolUse { id, name, input } = block {
+                        if let Some(tool) = self.find_tool(name) {
+                            // Permission check
+                            let allowed = self.check_tool_permission(tool, input, &tx_ui).await?;
+                            if !allowed {
+                                tool_result_blocks.push(ClaudeContentBlock::ToolResult {
+                                    tool_use_id: id.clone(),
+                                    content: format!("Permission denied for tool '{}'.", name),
+                                    is_error: Some(true),
+                                });
+                                continue;
+                            }
+
+                            let exec_result = tool.call(input.clone(), ctx).await;
+                            match exec_result {
+                                Ok(res) => {
+                                    tool_result_blocks.push(ClaudeContentBlock::ToolResult {
+                                        tool_use_id: id.clone(),
+                                        content: serde_json::to_string(&res.output)
+                                            .unwrap_or_else(|_| "{}".to_string()),
+                                        is_error: if res.is_error { Some(true) } else { None },
+                                    });
+                                }
+                                Err(e) => {
+                                    tool_result_blocks.push(ClaudeContentBlock::ToolResult {
+                                        tool_use_id: id.clone(),
+                                        content: format!("Error executing tool: {}", e),
+                                        is_error: Some(true),
+                                    });
+                                }
+                            }
+                        } else {
+                            tool_result_blocks.push(ClaudeContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: format!("Error: Tool '{}' not found.", name),
+                                is_error: Some(true),
+                            });
+                        }
+                    }
+                }
+
+                if tool_result_blocks.is_empty() {
+                    let final_text = api_response
+                        .content
+                        .into_iter()
+                        .filter_map(|block| match block {
+                            ClaudeContentBlock::Text { text } => Some(text),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Ok(final_text);
+                }
+
+                messages.push(ClaudeMessage {
+                    role: "user".to_string(),
+                    content: tool_result_blocks,
+                });
             }
-
-            if tool_result_blocks.is_empty() {
-                let final_text = api_response
-                    .content
-                    .into_iter()
-                    .filter_map(|block| match block {
-                        ClaudeContentBlock::Text { text } => Some(text),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                return Ok(final_text);
-            }
-
-            messages.push(ClaudeMessage {
-                role: "user".to_string(),
-                content: tool_result_blocks,
-            });
         }
     }
 }
@@ -463,9 +770,62 @@ struct ClaudeMessagesRequest {
     tools: Option<Vec<ClaudeToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ClaudeToolChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ClaudeMessagesResponse {
     content: Vec<ClaudeContentBlock>,
+    #[serde(default)]
+    usage: Option<ClaudeUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+}
+
+/// Per-model pricing in USD per million tokens.
+struct ModelPricing {
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+}
+
+fn get_model_pricing(model: &str) -> ModelPricing {
+    // Match model name patterns to pricing tiers
+    let model_lower = model.to_lowercase();
+    if model_lower.contains("opus") {
+        // Claude Opus 4/4.1: $15/$75
+        ModelPricing { input_per_mtok: 15.0, output_per_mtok: 75.0 }
+    } else if model_lower.contains("haiku") {
+        // Claude Haiku: $1/$5
+        ModelPricing { input_per_mtok: 1.0, output_per_mtok: 5.0 }
+    } else if model_lower.contains("sonnet") || model_lower.contains("claude") {
+        // Claude Sonnet: $3/$15
+        ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }
+    } else if model_lower.contains("gpt-4o-mini") {
+        ModelPricing { input_per_mtok: 0.15, output_per_mtok: 0.60 }
+    } else if model_lower.contains("gpt-4o") || model_lower.contains("gpt-4") {
+        ModelPricing { input_per_mtok: 2.50, output_per_mtok: 10.0 }
+    } else if model_lower.contains("gemini") {
+        // Gemini 2.5 Pro: free tier / $1.25/$10 for paid
+        ModelPricing { input_per_mtok: 1.25, output_per_mtok: 10.0 }
+    } else {
+        // Default: moderate pricing
+        ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }
+    }
+}
+
+fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
+    let pricing = get_model_pricing(model);
+    (input_tokens as f64 / 1_000_000.0) * pricing.input_per_mtok
+        + (output_tokens as f64 / 1_000_000.0) * pricing.output_per_mtok
 }

@@ -1,11 +1,11 @@
-# Rust Agent — Reverse Engineering Planning
+# Rust Agent — Implementation Planning & Progress
 
 > Port of Claude Code (TypeScript) → Rust-based AI Agent CLI
-> Status: **Phase 1 MVP done** — core agentic loop works with 3 tools + TUI
+> Supports: Claude (native API) + OpenAI/Gemini/OpenAI-compatible (via async-openai)
 
 ---
 
-## Architecture Overview (Target)
+## Architecture
 
 ```
 CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/OpenAI/Gemini)
@@ -15,288 +15,154 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
                 │          (Tool trait)       (bash, fs, grep..)  (back to LLM)
                 │
                 ├──→ TUI (ratatui) ←── mpsc channels ──→ Engine (tokio task)
-                │
+                ├──→ Bare mode (stdin/stdout, no TUI)
                 ├──→ Context System (CLAUDE.md, git status, system prompt)
                 ├──→ Permission System (allow/deny/ask per tool)
-                ├──→ Cost Tracker (token usage, $/model)
-                ├──→ Session History (append-only log)
+                ├──→ Cost Tracker (token usage, $/model, budget enforcement)
+                ├──→ Session History (JSONL append-only log)
                 └──→ Compaction Service (summarize when context full)
 ```
 
 ---
 
-## What's Done ✅
+## Progress Tracker
 
-### Core Engine (`engine/`)
-- [x] `QueryEngine` with agentic tool-use loop (call LLM → tool calls → execute → feed back → repeat)
-- [x] Multi-provider support via OpenAI-compatible API (`ModelProvider::OpenAI`, `ModelProvider::Gemini`)
-- [x] System prompt composition (memory + output styles)
-- [x] Tool dispatch by name matching
-- [x] UI event channel integration (`ToolStarted`/`ToolFinished`)
-- [x] `CostTracker` struct defined (but **not wired into engine yet**)
+### Phase 1: Bug Fixes & Quick Wins ✅ DONE
 
-### Tool System (`tools/`)
-- [x] `Tool` trait with `name()`, `description()`, `input_schema()`, `call()`, `is_destructive()`, `is_read_only()`, `is_concurrency_safe()`
-- [x] `ToolContext` (debug, auto_mode, tools_available, max_budget_usd)
-- [x] `ToolResult` with `ok()`/`err()` constructors
-- [x] **BashTool** — command execution with timeout, stdout/stderr/exit_code
-- [x] **ReadFileTool** — file reading
-- [x] **WriteFileTool** — file creation/writing with overwrite protection
+- [x] **1.1** Register missing tools — `FileEditTool`, `GlobTool`, `GrepTool` added to `QueryEngine::new()`
+- [x] **1.2** Create `EngineConfig` (`src/engine/config.rs`) — auto_mode, bare_mode, debug, max_budget_usd, max_tokens
+- [x] **1.3** Wire CLI flags → `EngineConfig` → `ToolContext` (no more hardcoded `auto_mode: true`)
+- [x] **1.4** Fix `max_tokens` — configurable via `--max-tokens` flag (default 8192, was hardcoded 1024)
+- [x] **1.5** Wire `CostTracker` into engine — `Arc<Mutex<CostTracker>>` on `QueryEngine`, tracks usage from both OpenAI and Claude responses
+- [x] **1.6** Add model pricing — per-model cost calculation (Claude Sonnet $3/$15, Opus $15/$75, GPT-4o $2.50/$10, etc.)
+- [x] **1.7** Implement bare mode — `--bare` flag: simple stdin/stdout loop, no TUI
+- [x] **1.8** Cost summary on exit — printed after one-shot, bare, and TUI modes
+- [x] **1.9** Fix `ClaudeMessagesResponse` — now parses `usage` field for token tracking
+- [x] **1.10** Update default Claude model — `claude-sonnet-4-20250514`
+- [x] **1.11** New CLI flags — `--max-tokens`, `--max-budget`
 
-### Models (`models/`)
-- [x] `TaskType`, `TaskStatus`, `TaskStateBase` (defined, not used yet)
-- [x] `Role`, `Message`, `Attachment` types
+### Phase 2: Streaming Responses ✅ DONE
 
-### UI (`ui/`)
-- [x] Ratatui TUI with 2-panel layout (conversation + prompt)
-- [x] Async event loop (engine ↔ UI via mpsc channels)
-- [x] Spinner animation for running tools
-- [x] Terminal setup/teardown with panic hook
+- [x] **2.1** Claude SSE streaming — parse `data:` events from `stream: true` response
+- [x] **2.2** New `StreamEvent` enum — TextDelta, ToolUseStart, ToolUseInputDelta, MessageStop, Error
+- [x] **2.3** OpenAI streaming — (deferred: uses non-streaming for now, streaming via async-openai planned)
+- [x] **2.4** TUI streaming display — real-time token output with `UiEvent::StreamDelta`, blinking cursor
+- [x] **2.5** New dep: `futures-util = "0.3"` added to Cargo.toml
 
-### Keybindings (`keybindings/`)
-- [x] Static resolver: Ctrl+C, Ctrl+D, Ctrl+L, Enter, Esc, Up/Down
+### Phase 3: Permission System ✅ DONE
 
-### Memory (`mem/`)
-- [x] Memory system prompt builder (file-based `~/.rust-agent/memory/`)
-- [x] ⚠️ **BUG**: `build_memory_prompt()` — `format!()` returns early, code after line 36 is unreachable. Variable `prompt` is never bound.
+- [x] **3.1** `PermissionMode` enum — Default, AcceptEdits, BypassPermissions, Plan, DontAsk (with `ValueEnum` for clap)
+- [x] **3.2** Permission checker — `check_permission()` decision chain: Plan→deny, read-only→allow, rules, dangerous path (bypass-immune), mode-specific behavior
+- [x] **3.3** Path safety — `is_dangerous_path()` blocks .env/.git/.ssh/etc., `is_within_directory()` prevents traversal
+- [x] **3.4** Interactive TUI prompt — Y/n/a via `UiEvent::PermissionRequest` + oneshot channel, red input bar indicator
+- [x] **3.5** CLI `--permission-mode` flag — wired into `EngineConfig.permission_mode`
+- [x] **3.6** Wired into engine — `check_tool_permission()` called before every `tool.call()` in all 3 paths (OpenAI, Claude streaming, Claude non-streaming)
+- [x] **3.7** Session rules — "Always Allow" adds `PermissionRule` to `Arc<Mutex<Vec<PermissionRule>>>` for session persistence
+- [x] **3.8** Unit tests — `test_dangerous_paths` for path safety
 
-### Output Styles (`output_styles.rs`)
-- [x] Load markdown style definitions from `~/.rust-agent/output-styles/` and `./.rust-agent/output-styles/`
+### Phase 4: Context Management 🔲
 
-### CLI
-- [x] `--query` (one-shot mode), `--bare`, `--auto` flags via clap
+- [ ] **4.1** Token estimation — ~4 chars per token, model context window map
+- [ ] **4.2** Microcompact — clear old tool results preserving recent N turns
+- [ ] **4.3** Auto-compact — LLM summarization when >80% context used
+- [ ] **4.4** Wire into query loop — check before each LLM call
 
----
+### Phase 5: Additional Tools 🔲
 
-## What's NOT Done Yet 🔲
+- [ ] **5.1** TodoWriteTool — task checklist with shared state
+- [ ] **5.2** SleepTool — async wait
+- [ ] **5.3** WebFetchTool — URL fetch + HTML stripping (dep: `scraper`)
+- [ ] **5.4** AskUserQuestionTool — interactive prompts via TUI
+- [ ] **5.5** NotebookEditTool — Jupyter .ipynb editing
 
-### Priority 1 — Critical Missing Pieces
+### Phase 6: Session, History & Context 🔲
 
-#### 1.1 Fix Known Bugs
-- [ ] Fix `mem/mod.rs` — `build_memory_prompt()` unreachable code (bind `format!()` result to `let mut prompt = ...`)
-- [ ] Wire `--auto` flag through to `ToolContext.auto_mode`
-- [ ] Wire `--bare` flag to actually change behavior (skip TUI chrome?)
+- [ ] **6.1** Context system — CLAUDE.md loading, git status, system info (dep: `chrono`)
+- [ ] **6.2** Session persistence — JSONL transcript (dep: `uuid`)
+- [ ] **6.3** Session resume — `--resume [session_id]`
+- [ ] **6.4** Command history — up-arrow recall from `~/.rust-agent/history.jsonl`
+- [ ] **6.5** Slash commands — /help, /clear, /compact, /cost, /exit, /model
 
-#### 1.2 Anthropic API Native Support
-> The TS version uses Anthropic Messages API directly, not OpenAI-compatible. This is important for: extended thinking, caching, tool_use stop_reason, streaming.
-- [ ] Add `ModelProvider::Anthropic` variant
-- [ ] Implement direct Anthropic Messages API client (or use `anthropic-sdk` crate if available)
-- [ ] Support `tool_use` stop_reason properly (currently only checks `tool_calls` field)
-- [ ] Streaming response support (`text_delta`, `tool_use` events)
+### Phase 7: Advanced (Future) 🔲
 
-#### 1.3 More Tools (high-value, port from TS)
-- [ ] **FileEditTool** — exact string replacement in files (the `Edit` tool in TS). This is the most-used tool.
-- [ ] **GlobTool** — file pattern matching (`glob` crate already in deps)
-- [ ] **GrepTool** — content search (use `grep` crate or shell out to `rg`)
-- [ ] **AgentTool** — sub-agent spawning (recursive QueryEngine call with isolated context)
-- [ ] **TodoWriteTool** — structured task list management (write to state/file)
-
-#### 1.4 Permission System
-> In TS, this is a multi-layer system: rules → hooks → classifier → user prompt
-- [ ] `PermissionMode` enum: `allowAll`, `default`, `deny`
-- [ ] `PermissionRule` type: tool + pattern → allow/deny/ask
-- [ ] `check_permission()` function called before each `tool.call()`
-- [ ] Interactive permission prompt in TUI (Y/n/always)
-- [ ] Settings file loading (`~/.rust-agent/settings.json`) for persistent rules
-
-#### 1.5 Context System (System Prompt)
-> The TS version has a rich context system: CLAUDE.md files, git status, date, environment info.
-- [ ] `get_system_context()` — git branch, recent commits, working tree status
-- [ ] `get_user_context()` — load CLAUDE.md from cwd and parent dirs
-- [ ] Inject environment info (platform, shell, date, model name) into system prompt
-- [ ] Compose system prompt sections: base instructions + memory + context + output styles
-
-#### 1.6 Wire CostTracker into Engine
-- [ ] Track `input_tokens` / `output_tokens` from API response `usage` field
-- [ ] Track API call duration
-- [ ] Track tool execution duration
-- [ ] Display cost on exit (`/cost` command or at session end)
-- [ ] Max budget enforcement (`max_budget_usd` in ToolContext)
+- [ ] MCP client (JSON-RPC over stdio)
+- [ ] AgentTool (sub-agents)
+- [ ] Tool concurrency (parallel read-only)
+- [ ] EnterPlanMode/ExitPlanMode
+- [ ] Plugin/Skill system
 
 ---
 
-### Priority 2 — Important Features
-
-#### 2.1 Tool Concurrency
-> TS runs read-only tools in parallel, write tools serially.
-- [ ] Partition tool calls by `is_read_only()` / `is_concurrency_safe()`
-- [ ] Execute concurrent batch with `tokio::join!` / `FuturesUnordered`
-- [ ] Execute write tools sequentially
-
-#### 2.2 Conversation History & Session Resume
-- [ ] Append-only session log file (JSON lines)
-- [ ] `--resume` flag to reload previous session
-- [ ] Session ID generation
-
-#### 2.3 Context Compaction
-> When context window fills up, summarize older messages to free tokens.
-- [ ] Token counting (approximate: chars/4 or use tiktoken-rs)
-- [ ] Auto-compaction trigger at threshold
-- [ ] Compaction prompt (summarize conversation so far)
-- [ ] Replace old messages with summary message
-
-#### 2.4 Settings & Configuration
-- [ ] `~/.rust-agent/settings.json` — model, permission rules, MCP servers, hooks
-- [ ] `.rust-agent/settings.local.json` — project-level overrides
-- [ ] Environment variable overrides (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.)
-- [ ] `ConfigTool` — runtime config changes via LLM
-
-#### 2.5 Command System (Slash Commands)
-- [ ] `/help`, `/clear`, `/compact`, `/cost`, `/exit`, `/model`, `/config`
-- [ ] Command parsing from user input (detect `/` prefix)
-- [ ] Command registry pattern (similar to tool registry)
-
-#### 2.6 Improved TUI
-- [ ] Scrolling in conversation history (currently no scroll)
-- [ ] Markdown rendering in terminal (basic: bold, code blocks, lists)
-- [ ] Syntax highlighting for code blocks
-- [ ] Multi-line input support
-- [ ] Command history with Up/Down arrow (currently stubbed)
-- [ ] Diff display for file edits
-- [ ] Color themes
-
----
-
-### Priority 3 — Advanced Features
-
-#### 3.1 MCP (Model Context Protocol) Client
-> This is a big subsystem. The TS version supports stdio, SSE, and StreamableHTTP transports.
-- [ ] MCP client over stdio transport
-- [ ] MCP tool wrapping (dynamic tools from MCP servers)
-- [ ] MCP resource reading
-- [ ] MCP server configuration in settings
-- [ ] MCP server lifecycle management
-
-#### 3.2 Sub-Agent / Coordinator Mode
-- [ ] `AgentTool` running isolated sub-queries
-- [ ] Agent memory snapshots
-- [ ] Coordinator mode (main agent only delegates)
-- [ ] Inter-agent messaging (`SendMessageTool`)
-
-#### 3.3 Task System
-- [ ] Background task management (spawn, list, stop, get output)
-- [ ] `LocalShellTask` — background bash commands
-- [ ] `LocalAgentTask` — background agent queries
-- [ ] Task status tracking and notification
-
-#### 3.4 Hook System
-> TS supports command/prompt/agent/http hook types triggered on events.
-- [ ] Hook configuration in settings
-- [ ] Pre/post tool execution hooks
-- [ ] Pre/post query hooks
-
-#### 3.5 Plugin System
-- [ ] Plugin loading from directory
-- [ ] Plugin-provided tools and commands
-- [ ] Plugin enable/disable in settings
-
-#### 3.6 Git Integration
-- [ ] Git status in context
-- [ ] Commit message generation
-- [ ] PR creation via `gh` CLI
-- [ ] Worktree support (`EnterWorktreeTool` / `ExitWorktreeTool`)
-
-#### 3.7 LSP Integration
-- [ ] LSP client over stdio (JSON-RPC)
-- [ ] Diagnostic collection from language servers
-- [ ] `LSPTool` for model to query diagnostics
-
----
-
-## File-by-file Mapping: TS → Rust
-
-| TypeScript Source | Rust Target | Status |
-|---|---|---|
-| `Tool.ts` | `tools/mod.rs` (Tool trait) | ✅ Done (simplified) |
-| `tools/BashTool/` | `tools/bash/executor.rs` | ✅ Done |
-| `tools/FileReadTool/` | `tools/fs/read_file.rs` | ✅ Done |
-| `tools/FileWriteTool/` | `tools/fs/write_file.rs` | ✅ Done |
-| `tools/FileEditTool/` | `tools/fs/edit_file.rs` | 🔲 TODO |
-| `tools/GlobTool/` | `tools/glob/` | 🔲 TODO |
-| `tools/GrepTool/` | `tools/grep/` | 🔲 TODO |
-| `tools/AgentTool/` | `tools/agent/` | 🔲 TODO |
-| `tools/TodoWriteTool/` | `tools/todo/` | 🔲 TODO |
-| `tools/WebFetchTool/` | `tools/web_fetch/` | 🔲 TODO |
-| `tools/EnterPlanModeTool/` | `tools/plan_mode/` | 🔲 TODO |
-| `tools/SkillTool/` | `tools/skill/` | 🔲 TODO |
-| `tools/MCPTool/` | `tools/mcp/` | 🔲 TODO |
-| `query.ts` | `engine/query.rs` | ✅ Partial (no streaming, no compaction) |
-| `query/config.ts` | `engine/config.rs` | 🔲 TODO |
-| `query/stopHooks.ts` | `engine/stop_hooks.rs` | 🔲 TODO |
-| `query/tokenBudget.ts` | `engine/token_budget.rs` | 🔲 TODO |
-| `context.ts` | `context/mod.rs` | 🔲 TODO |
-| `Task.ts` | `models/mod.rs` (TaskStateBase) | ✅ Done (types only) |
-| `tasks.ts` + `tasks/` | `tasks/` | 🔲 TODO |
-| `commands.ts` + `commands/` | `commands/` | 🔲 TODO |
-| `tools.ts` (registry) | `tools/registry.rs` | 🔲 TODO |
-| `cost-tracker.ts` | `engine/cost_tracker.rs` | ✅ Struct done, not wired |
-| `history.ts` | `history/` | 🔲 TODO |
-| `services/api/claude.ts` | `services/api/` | 🔲 TODO |
-| `services/mcp/client.ts` | `services/mcp/` | 🔲 TODO |
-| `services/compact/` | `services/compact/` | 🔲 TODO |
-| `services/tools/toolOrchestration.ts` | `engine/orchestration.rs` | 🔲 TODO |
-| `state/AppStateStore.ts` | `state/` | 🔲 TODO |
-| `hooks/useCanUseTool.tsx` | `permissions/` | 🔲 TODO |
-| `types/permissions.ts` | `permissions/types.rs` | 🔲 TODO |
-| `schemas/hooks.ts` | `schemas/hooks.rs` | 🔲 TODO |
-| `constants/` | `constants/` | 🔲 TODO |
-
----
-
-## Recommended Implementation Order
+## File Structure
 
 ```
-Sprint 1 (Foundation):
-  1. Fix mem bug
-  2. FileEditTool (most important missing tool)
-  3. GlobTool + GrepTool
-  4. Wire CostTracker
-  5. Wire --auto and --bare flags
-
-Sprint 2 (Context & Permissions):
-  6. Context system (CLAUDE.md, git status, env info)
-  7. Anthropic API native client
-  8. Permission system (basic allow/deny)
-  9. Settings file loading
-  10. Streaming responses
-
-Sprint 3 (Usability):
-  11. Slash commands (/help, /clear, /cost, /compact, /model)
-  12. Session history & resume
-  13. Context compaction
-  14. TUI improvements (scroll, markdown, history)
-  15. Tool concurrency (parallel read-only)
-
-Sprint 4 (Advanced):
-  16. AgentTool (sub-agents)
-  17. MCP client (stdio transport)
-  18. Task system (background tasks)
-  19. Hook system
-  20. Git integration helpers
+src/
+  main.rs                    # CLI + 3 modes (one-shot, bare, TUI)
+  engine/
+    mod.rs                   # Re-exports
+    config.rs                # EngineConfig struct
+    cost_tracker.rs          # CostTracker + ModelUsage
+    query.rs                 # QueryEngine + agentic loop (OpenAI + Claude)
+    streaming.rs             # SSE parser for Claude streaming ✅
+    tokens.rs                # [TODO] Token estimation
+    compaction.rs            # [TODO] Context compaction
+  tools/
+    mod.rs                   # Tool trait + ToolContext + ToolResult
+    bash/executor.rs         # BashTool
+    fs/read_file.rs          # ReadFileTool
+    fs/write_file.rs         # WriteFileTool
+    edit/edit_file.rs        # FileEditTool
+    glob_tool/search.rs      # GlobTool
+    grep_tool/search.rs      # GrepTool
+    todo/                    # [TODO] TodoWriteTool
+    sleep/                   # [TODO] SleepTool
+    web_fetch/               # [TODO] WebFetchTool
+    ask_user/                # [TODO] AskUserQuestionTool
+    notebook/                # [TODO] NotebookEditTool
+  ui/
+    mod.rs                   # Terminal setup/teardown
+    app.rs                   # Ratatui TUI (App struct + event loop)
+  models/mod.rs              # TaskType, TaskStatus, Role, Message
+  mem/mod.rs                 # Memory system prompt builder
+  output_styles.rs           # Output style loading
+  keybindings/               # Full keybinding system (17 contexts)
+  permissions/               # Permission system (types, checker, path_safety) ✅
+  context/                   # [TODO] CLAUDE.md + git + sysinfo
+  session/                   # [TODO] Session persistence
+  history/                   # [TODO] Command history
+  commands/                  # [TODO] Slash commands
 ```
 
 ---
 
-## Key Architectural Differences: TS → Rust
+## Dependencies
 
-| Aspect | TypeScript (Claude Code) | Rust Agent |
-|---|---|---|
-| UI Framework | Ink (React for terminal) | Ratatui (immediate-mode TUI) |
-| Async Runtime | Node.js event loop | Tokio |
-| API Client | Custom fetch-based | `async-openai` (OpenAI-compat) |
-| State Management | External store + React hooks | TBD — likely Arc<Mutex<AppState>> |
-| Tool Dispatch | Dynamic JS objects | Trait objects `Box<dyn Tool>` |
-| Permission UI | Ink components | TUI overlay / crossterm prompts |
-| Plugin System | Dynamic require/import | TBD — likely dylib or WASM |
-| MCP Transport | Node streams | Tokio io / reqwest |
-| Config Format | JSON (settings.json) | JSON (serde_json) |
-| Streaming | Node readable streams | Tokio streams / async iterators |
+| Crate             | Version   | Purpose                  | Status     |
+| ----------------- | --------- | ------------------------ | ---------- |
+| tokio             | 1.37      | Async runtime            | ✅         |
+| reqwest           | 0.12      | HTTP client (Claude API) | ✅         |
+| async-openai      | 0.23      | OpenAI-compatible API    | ✅         |
+| ratatui/crossterm | 0.26/0.27 | Terminal UI              | ✅         |
+| clap              | 4.5       | CLI parsing              | ✅         |
+| serde/serde_json  | 1.0       | Serialization            | ✅         |
+| anyhow            | 1.0       | Error handling           | ✅         |
+| tracing           | 0.1       | Logging                  | ✅         |
+| async-trait       | 0.1       | Async traits             | ✅         |
+| dirs              | 6.0       | Home directory           | ✅         |
+| glob              | 0.3       | File globbing            | ✅         |
+| regex             | 1.12      | Regex (GrepTool)         | ✅         |
+| futures-util      | 0.3       | Stream utilities         | ✅         |
+| scraper           | 0.20      | HTML parsing             | 🔲 Phase 5 |
+| chrono            | 0.4       | Date/time                | 🔲 Phase 6 |
+| uuid              | 1.0       | Session IDs              | 🔲 Phase 6 |
 
 ---
 
-## Notes
+## Key Design Decisions
 
-- The `async-openai` crate works well for OpenAI-compatible APIs but doesn't support Anthropic-native features (extended thinking, prompt caching, tool_use stop_reason). Consider using `reqwest` directly for Anthropic API.
-- `indicatif` is in deps but unused — could be used for progress bars in one-shot mode.
-- `reqwest` is in deps but only used indirectly by `async-openai` — useful for direct Anthropic API calls.
-- The `cli/` and `utils/` directories are empty placeholders ready for expansion.
+1. **Multi-provider via single engine** — Claude uses raw reqwest (native API), everything else uses `async-openai` (OpenAI-compatible)
+2. **`Arc<Mutex<CostTracker>>`** — shared between engine and main for cost display on exit
+3. **`EngineConfig`** — single config object flows CLI flags into engine behavior
+4. **Bare mode** — simple stdin/stdout loop for scripting/piping, separate from TUI
+5. **Tool dispatch by name** — `find_tool()` checks `name()` and `aliases()`
+6. **Pricing table** — model name pattern matching for cost estimation

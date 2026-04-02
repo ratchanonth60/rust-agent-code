@@ -7,6 +7,7 @@ edition = "2021"
 # Async Runtime & HTTP
 tokio = { version = "1.37", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+async-openai = "0.23"
 
 # UI & Terminal
 ratatui = "0.26"
@@ -29,3 +30,4 @@ async-trait = "0.1.89"
 dirs = "6.0.0"
 glob = "0.3.3"
 regex = "1.12.3"
+futures-util = "0.3"

@@ -5,13 +5,15 @@ pub mod ui;
 pub mod mem;
 pub mod keybindings;
 pub mod output_styles;
+pub mod permissions;
 
 use clap::Parser;
 use tokio::sync::mpsc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::engine::{ModelProvider, QueryEngine};
+use crate::engine::{EngineConfig, ModelProvider, QueryEngine};
+use crate::permissions::PermissionMode;
 
 /// Rust-based AI Agent CLI (ported from TypeScript)
 #[derive(Parser, Debug)]
@@ -21,11 +23,11 @@ struct Args {
     #[arg(short, long)]
     query: Option<String>,
 
-    /// Run in bare/simple mode
+    /// Run in bare/simple mode (no TUI, stdin/stdout only)
     #[arg(long, default_value_t = false)]
     bare: bool,
 
-    /// Automatically run commands and bypass permission prompts [Y/n]
+    /// Automatically run commands and bypass permission prompts
     #[arg(long, default_value_t = false)]
     auto: bool,
 
@@ -44,13 +46,25 @@ struct Args {
     /// API base URL override for selected provider
     #[arg(long)]
     api_base: Option<String>,
+
+    /// Maximum output tokens per LLM call
+    #[arg(long, default_value_t = 8192)]
+    max_tokens: u32,
+
+    /// Maximum budget in USD for this session
+    #[arg(long)]
+    max_budget: Option<f64>,
+
+    /// Permission mode for tool authorization
+    #[arg(long, value_enum, default_value_t = PermissionMode::Default)]
+    permission_mode: PermissionMode,
 }
 
 fn default_model(provider: ModelProvider) -> &'static str {
     match provider {
         ModelProvider::Gemini => "gemini-2.5-pro",
         ModelProvider::OpenAI => "gpt-4o-mini",
-        ModelProvider::Claude => "claude-3-7-sonnet-latest",
+        ModelProvider::Claude => "claude-sonnet-4-20250514",
         ModelProvider::OpenAICompatible => "gpt-4o-mini",
     }
 }
@@ -70,9 +84,6 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     info!("Starting Rust Agent...");
-    if args.bare {
-        info!("Running in bare mode.");
-    }
 
     let selected_model = args
         .model
@@ -83,30 +94,79 @@ async fn main() -> anyhow::Result<()> {
         args.provider, selected_model
     );
 
+    let config = EngineConfig {
+        auto_mode: args.auto,
+        bare_mode: args.bare,
+        debug: false,
+        max_budget_usd: args.max_budget,
+        max_tokens: args.max_tokens,
+        permission_mode: args.permission_mode,
+    };
+
     let engine = QueryEngine::new(
         selected_model,
         args.provider,
         args.api_key.clone(),
         args.api_base.clone(),
+        config,
     )?;
 
     if let Some(q) = args.query {
+        // One-shot mode
         info!("Received query: {}", q);
+        let cost_tracker = engine.cost_tracker.clone();
         let result = engine.query(&q, None).await;
-        
+
         match result {
-            Ok(res) => println!("\n🤖 Agent says:\n{}", res),
-            Err(e) => eprintln!("Error querying AI: {:?}", e),
+            Ok(res) => println!("{}", res),
+            Err(e) => eprintln!("Error: {:?}", e),
         }
+
+        // Print cost summary
+        print_cost_summary(&cost_tracker);
+    } else if args.bare {
+        // Bare mode: simple stdin/stdout loop, no TUI
+        info!("Running in bare mode.");
+        let cost_tracker = engine.cost_tracker.clone();
+        let engine = std::sync::Arc::new(engine);
+
+        let stdin = tokio::io::stdin();
+        let reader = tokio::io::BufReader::new(stdin);
+
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = reader.lines();
+
+        eprintln!("Rust Agent (bare mode). Type your query, press Enter. Ctrl+D to exit.");
+        loop {
+            eprint!("> ");
+            match lines.next_line().await? {
+                Some(line) => {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if line == "quit" || line == "exit" {
+                        break;
+                    }
+                    match engine.query(&line, None).await {
+                        Ok(res) => println!("{}", res),
+                        Err(e) => eprintln!("Error: {:?}", e),
+                    }
+                }
+                None => break, // EOF
+            }
+        }
+
+        print_cost_summary(&cost_tracker);
     } else {
-        info!("No query provided. Starting interactive UI...");
-        
+        // Interactive TUI mode
+        info!("Starting interactive UI...");
+
         // Setup channels for UI <-> Engine
         let (tx_to_engine, mut rx_to_engine) = mpsc::channel::<String>(32);
         let (tx_to_ui, rx_to_ui) = mpsc::channel::<ui::app::UiEvent>(32);
 
-        // Make engine Send + Sync by wrapping heavily if needed, 
-        // but here engine is owned by the background task
+        let cost_tracker = engine.cost_tracker.clone();
         let engine_clone = std::sync::Arc::new(engine);
 
         tokio::spawn(async move {
@@ -125,10 +185,13 @@ async fn main() -> anyhow::Result<()> {
         // Enter interactive Ratatui mode
         let mut terminal = ui::setup_terminal()?;
         let mut app = ui::app::App::new(tx_to_engine, rx_to_ui);
-        
+
         let app_result = app.run(&mut terminal).await;
 
         ui::restore_terminal()?;
+
+        // Print cost summary on exit
+        print_cost_summary(&cost_tracker);
 
         if let Err(err) = app_result {
             eprintln!("App error: {:?}", err);
@@ -136,4 +199,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn print_cost_summary(cost_tracker: &std::sync::Arc<std::sync::Mutex<crate::engine::cost_tracker::CostTracker>>) {
+    if let Ok(tracker) = cost_tracker.lock() {
+        if tracker.total_cost_usd > 0.0 {
+            eprintln!("\n{}", tracker.format_total_cost());
+        }
+    }
 }
