@@ -10,6 +10,7 @@
 //! - **OpenAI / Gemini / OpenAI-compatible** — via [`async_openai`]
 
 use anyhow::{anyhow, Context, Result};
+use futures_util::future::join_all;
 use async_openai::{
     config::OpenAIConfig,
     types::{
@@ -784,12 +785,14 @@ impl QueryEngine {
                     return Ok(streamed.text);
                 }
 
-                let mut tool_result_blocks = Vec::new();
-                for tu in &streamed.tool_uses {
-                    let tool_input = parse_tool_input(&tu.input_json);
-                    let block = self.execute_claude_tool(&tu.id, &tu.name, tool_input, ctx, &tx_ui).await?;
-                    tool_result_blocks.push(block);
-                }
+                let calls: Vec<ToolCall> = streamed.tool_uses.iter()
+                    .map(|tu| ToolCall {
+                        id: tu.id.clone(),
+                        name: tu.name.clone(),
+                        input: parse_tool_input(&tu.input_json),
+                    })
+                    .collect();
+                let tool_result_blocks = self.execute_tools_parallel(&calls, ctx, &tx_ui).await?;
 
                 messages.push(ClaudeMessage {
                     role: "user".to_string(),
@@ -815,13 +818,16 @@ impl QueryEngine {
                     content: api_response.content.clone(),
                 });
 
-                let mut tool_result_blocks = Vec::new();
-                for block in &api_response.content {
-                    if let ClaudeContentBlock::ToolUse { id, name, input } = block {
-                        let result = self.execute_claude_tool(id, name, input.clone(), ctx, &tx_ui).await?;
-                        tool_result_blocks.push(result);
-                    }
-                }
+                let calls: Vec<ToolCall> = api_response.content.iter()
+                    .filter_map(|block| {
+                        if let ClaudeContentBlock::ToolUse { id, name, input } = block {
+                            Some(ToolCall { id: id.clone(), name: name.clone(), input: input.clone() })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let tool_result_blocks = self.execute_tools_parallel(&calls, ctx, &tx_ui).await?;
 
                 if tool_result_blocks.is_empty() {
                     let final_text = api_response
@@ -844,27 +850,42 @@ impl QueryEngine {
         }
     }
 
-    /// Executes a single Claude tool call and returns a [`ClaudeContentBlock::ToolResult`].
-    ///
-    /// Shared by both the streaming and non-streaming Claude paths.
-    /// Handles permission checks, TUI notifications, and error wrapping.
-    async fn execute_claude_tool(
+    /// Execute a batch of tool calls: permission checks run sequentially (one TUI dialog at a
+    /// time), then all approved tools execute concurrently.  Results are returned in the same
+    /// order as `calls`.
+    async fn execute_tools_parallel(
         &self,
+        calls: &[ToolCall],
+        ctx: &ToolContext,
+        tx_ui: &Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+    ) -> Result<Vec<ClaudeContentBlock>> {
+        // Phase 1: sequential permission checks (user prompts must not overlap).
+        let mut permitted = Vec::with_capacity(calls.len());
+        for call in calls {
+            let allowed = match self.find_tool(&call.name) {
+                None => false,
+                Some(tool) => self.check_tool_permission(tool, &call.input, tx_ui).await?,
+            };
+            permitted.push(allowed);
+        }
+
+        // Phase 2: parallel execution — all approved tools run concurrently.
+        let futs = calls.iter().zip(permitted.into_iter()).map(|(call, allowed)| {
+            self.run_tool(allowed, &call.id, &call.name, call.input.clone(), ctx, tx_ui)
+        });
+        join_all(futs).await.into_iter().collect()
+    }
+
+    /// Execute a single tool whose permission has already been resolved.
+    async fn run_tool(
+        &self,
+        allowed: bool,
         tool_use_id: &str,
         tool_name: &str,
         tool_input: Value,
         ctx: &ToolContext,
         tx_ui: &Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
     ) -> Result<ClaudeContentBlock> {
-        let Some(tool) = self.find_tool(tool_name) else {
-            return Ok(ClaudeContentBlock::ToolResult {
-                tool_use_id: tool_use_id.to_string(),
-                content: format!("Error: Tool '{}' not found.", tool_name),
-                is_error: Some(true),
-            });
-        };
-
-        let allowed = self.check_tool_permission(tool, &tool_input, tx_ui).await?;
         if !allowed {
             return Ok(ClaudeContentBlock::ToolResult {
                 tool_use_id: tool_use_id.to_string(),
@@ -872,6 +893,14 @@ impl QueryEngine {
                 is_error: Some(true),
             });
         }
+
+        let Some(tool) = self.find_tool(tool_name) else {
+            return Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Error: Tool '{}' not found.", tool_name),
+                is_error: Some(true),
+            });
+        };
 
         let exec_result = tool.call(tool_input, ctx).await;
         if let Some(ref tx) = tx_ui {
@@ -894,6 +923,13 @@ impl QueryEngine {
 }
 
 // ── Claude API wire types ──────────────────────────────────────────
+
+/// A pending tool invocation extracted from an LLM response.
+struct ToolCall {
+    id: String,
+    name: String,
+    input: Value,
+}
 
 /// Tool definition in the Claude Messages API format.
 #[derive(Debug, Clone, Serialize)]
