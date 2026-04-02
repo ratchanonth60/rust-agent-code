@@ -74,7 +74,7 @@ fn default_model(provider: ModelProvider) -> &'static str {
     match provider {
         ModelProvider::Gemini => "gemini-2.5-pro",
         ModelProvider::OpenAI => "gpt-4o-mini",
-        ModelProvider::Claude => "claude-sonnet-4-20250514",
+        ModelProvider::Claude => "claude-sonnet-4-6",
         ModelProvider::OpenAICompatible => "gpt-4o-mini",
     }
 }

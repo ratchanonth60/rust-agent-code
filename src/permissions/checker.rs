@@ -86,12 +86,11 @@ pub fn check_permission(
 
     // 6. AcceptEdits + within working dir → allow writes
     if mode == PermissionMode::AcceptEdits {
-        if let Some(file_path) = extract_file_path(tool_name, input) {
-            if is_within_directory(&file_path, cwd) {
-                return PermissionDecision::Allow;
-            }
+        let file_path = extract_file_path(tool_name, input);
+        let in_cwd = file_path.as_deref().map_or(false, |p| is_within_directory(p, cwd));
+        if in_cwd {
+            return PermissionDecision::Allow;
         }
-        // For Bash and other non-file tools, still ask
         if tool.is_destructive() {
             return PermissionDecision::Ask {
                 tool_name: tool_name.to_string(),

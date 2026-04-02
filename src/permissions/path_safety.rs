@@ -32,24 +32,9 @@ const DANGEROUS_DIRS: &[&str] = &[
 
 /// Returns `true` if the file path is considered dangerous for auto-approval.
 pub fn is_dangerous_path(path: &str) -> bool {
-    let path_lower = path.to_lowercase();
-
-    // Check dangerous files
-    for dangerous in DANGEROUS_FILES {
-        if path_lower.ends_with(dangerous) {
-            return true;
-        }
-    }
-
-    // Check dangerous directories
-    for dangerous_dir in DANGEROUS_DIRS {
-        let pattern = format!("{}/", dangerous_dir);
-        if path_lower.contains(&pattern) || path_lower == *dangerous_dir {
-            return true;
-        }
-    }
-
-    false
+    let p = path.to_lowercase();
+    DANGEROUS_FILES.iter().any(|f| p.ends_with(f))
+        || DANGEROUS_DIRS.iter().any(|d| p.contains(&format!("{d}/")) || p == *d)
 }
 
 /// Returns `true` if the path is within the given working directory (no traversal escape).

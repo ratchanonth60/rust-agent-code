@@ -73,12 +73,10 @@ impl Tool for WriteFileTool {
         }
 
         if let Some(parent) = file_path.parent() {
-            if !parent.exists() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return Ok(ToolResult::err(serde_json::json!({
-                        "error": format!("Failed to create parent directory: {}", e)
-                    })));
-                }
+            if let Err(e) = fs::create_dir_all(parent) {
+                return Ok(ToolResult::err(serde_json::json!({
+                    "error": format!("Failed to create parent directory: {}", e)
+                })));
             }
         }
 
