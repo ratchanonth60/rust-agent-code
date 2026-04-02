@@ -1,34 +1,33 @@
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     backend::Backend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
     Frame,
     Terminal,
 };
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
 
+// ── Claude Code style characters ─────────────────────────────────────────
+const ASSISTANT_PREFIX: &str = "  \u{23BF} "; // ⎿ (left square bracket extension)
+const DIVIDER_CHAR: char = '\u{2500}';         // ─ (box-drawing horizontal)
+const DOT: &str = "\u{25CF}";                  // ● (filled circle)
+const PROMPT_CHAR: &str = ">";
+
 /// Events sent from the engine background task to the TUI for rendering.
 pub enum UiEvent {
-    /// The LLM produced a final text response (non-streaming fallback).
     LLMResponse(String),
-    /// The LLM call failed with an error message.
     LLMError(String),
-    /// A tool execution has started (carries the tool name).
     ToolStarted(String),
-    /// A tool execution has finished (carries the tool name).
     ToolFinished(String),
-    /// A streaming text delta arrived from the LLM.
     StreamDelta(String),
-    /// Streaming has started for a new response.
     StreamStart,
-    /// Streaming has finished — the current_stream is finalized.
     StreamEnd,
-    /// Permission prompt: engine asks the user to allow/deny a tool.
     PermissionRequest {
         tool_name: String,
         description: String,
@@ -36,37 +35,50 @@ pub enum UiEvent {
     },
 }
 
-/// The user's response to a permission prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionResponse {
-    /// Allow this one invocation.
     Allow,
-    /// Deny this one invocation.
     Deny,
-    /// Allow all future invocations of this tool (for this session).
     AlwaysAllow,
 }
 
-/// The interactive TUI application state, managing input, messages, and channel I/O.
+// ── Typed message entries ────────────────────────────────────────────────
+
+#[derive(Clone)]
+enum MessageEntry {
+    /// User prompt: "> text"
+    User(String),
+    /// Assistant text: "  ⎿ text"
+    Assistant(String),
+    /// Tool started: "  ● ToolName"  (dim while running, green when done)
+    ToolUse { name: String, done: bool, error: bool },
+    /// Error message (red)
+    Error(String),
+    /// System/info message (dim)
+    System(String),
+    /// Horizontal divider
+    Divider,
+    /// Permission request line
+    Permission { tool_name: String, description: String },
+}
+
 pub struct App {
     pub input: String,
-    pub messages: Vec<String>,
+    messages: Vec<MessageEntry>,
     pub exit: bool,
     pub running_tool: Option<String>,
     pub frame_ticker: usize,
-    /// Accumulates streaming text from the LLM. `None` when not streaming.
     pub current_stream: Option<String>,
     tx_to_engine: mpsc::Sender<String>,
     rx_from_engine: mpsc::Receiver<UiEvent>,
-    /// Loaded keybindings (defaults + user overrides).
     bindings: Vec<crate::keybindings::ParsedBinding>,
-    /// Auto-scroll offset (number of lines to skip from top).
     scroll_offset: u16,
-    /// Pending permission prompt awaiting user input (Y/n/a).
     pending_permission: Option<PendingPermission>,
+    pub cost_tracker: Option<Arc<Mutex<crate::engine::cost_tracker::CostTracker>>>,
+    /// Terminal width for divider rendering.
+    term_width: u16,
 }
 
-/// State for an active permission prompt.
 struct PendingPermission {
     tool_name: String,
     description: String,
@@ -74,7 +86,6 @@ struct PendingPermission {
 }
 
 impl App {
-    /// Creates a new App with the given engine communication channels.
     pub fn new(tx_to_engine: mpsc::Sender<String>, rx_from_engine: mpsc::Receiver<UiEvent>) -> Self {
         let load_result = crate::keybindings::load_keybindings();
         if !load_result.warnings.is_empty() {
@@ -82,10 +93,7 @@ impl App {
         }
         Self {
             input: String::new(),
-            messages: vec![
-                "Welcome to the Rust AI Agent.".to_string(),
-                "Type your query clearly. Press Ctrl+C or type 'quit' to exit.".to_string(),
-            ],
+            messages: vec![],
             exit: false,
             running_tool: None,
             frame_ticker: 0,
@@ -95,28 +103,54 @@ impl App {
             bindings: load_result.bindings,
             scroll_offset: 0,
             pending_permission: None,
+            cost_tracker: None,
+            term_width: 80,
         }
     }
 
-    /// Runs the main TUI event loop: draws frames, polls engine events, and handles keyboard input.
     pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         while !self.exit {
-            // Draw UI
-            terminal.draw(|f| self.ui(f))?;
+            terminal.draw(|f| {
+                self.term_width = f.size().width;
+                self.ui(f);
+            })?;
 
-            // Process async events from the LLM Engine (non-blocking)
             while let Ok(event) = self.rx_from_engine.try_recv() {
                 match event {
                     UiEvent::LLMResponse(res) => {
-                        self.messages.push(format!("Agent: {}", res));
+                        self.messages.push(MessageEntry::Assistant(res));
                         self.auto_scroll();
                     }
                     UiEvent::LLMError(err) => {
-                        self.messages.push(format!("Error: {}", err));
+                        self.messages.push(MessageEntry::Error(err));
                         self.auto_scroll();
                     }
-                    UiEvent::ToolStarted(name) => self.running_tool = Some(name),
-                    UiEvent::ToolFinished(_) => self.running_tool = None,
+                    UiEvent::ToolStarted(name) => {
+                        self.running_tool = Some(name.clone());
+                        self.messages.push(MessageEntry::ToolUse {
+                            name,
+                            done: false,
+                            error: false,
+                        });
+                        self.auto_scroll();
+                    }
+                    UiEvent::ToolFinished(name) => {
+                        self.running_tool = None;
+                        // Mark the matching tool entry as done
+                        for msg in self.messages.iter_mut().rev() {
+                            if let MessageEntry::ToolUse {
+                                name: ref n,
+                                ref mut done,
+                                ..
+                            } = msg
+                            {
+                                if *n == name {
+                                    *done = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     UiEvent::StreamStart => {
                         self.current_stream = Some(String::new());
                     }
@@ -131,16 +165,20 @@ impl App {
                     UiEvent::StreamEnd => {
                         if let Some(stream) = self.current_stream.take() {
                             if !stream.is_empty() {
-                                self.messages.push(format!("Agent: {}", stream));
+                                self.messages.push(MessageEntry::Assistant(stream));
                             }
                         }
                         self.auto_scroll();
                     }
-                    UiEvent::PermissionRequest { tool_name, description, response_tx } => {
-                        self.messages.push(format!(
-                            "[Permission] {} — {} (Y/n/a)",
-                            tool_name, description
-                        ));
+                    UiEvent::PermissionRequest {
+                        tool_name,
+                        description,
+                        response_tx,
+                    } => {
+                        self.messages.push(MessageEntry::Permission {
+                            tool_name: tool_name.clone(),
+                            description: description.clone(),
+                        });
                         self.pending_permission = Some(PendingPermission {
                             tool_name,
                             description,
@@ -151,10 +189,9 @@ impl App {
                 }
             }
 
-            // Process terminal input events (non-blocking interval 50ms for smoother streaming)
             if event::poll(Duration::from_millis(50))? {
                 if let Event::Key(key) = event::read()? {
-                    // If a permission prompt is pending, intercept Y/n/a keys
+                    // Permission prompt intercept
                     if self.pending_permission.is_some() {
                         let response = match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -171,44 +208,44 @@ impl App {
 
                         if let Some(resp) = response {
                             let perm = self.pending_permission.take().unwrap();
-                            self.messages.push(format!(
-                                "[Permission] {} → {:?}",
-                                perm.tool_name, resp
-                            ));
+                            let label = match &resp {
+                                PermissionResponse::Allow => "allowed",
+                                PermissionResponse::Deny => "denied",
+                                PermissionResponse::AlwaysAllow => "always allowed",
+                            };
+                            self.messages.push(MessageEntry::System(format!(
+                                "  {} {}",
+                                perm.tool_name, label
+                            )));
                             let _ = perm.response_tx.send(resp);
                             self.auto_scroll();
-                            continue; // skip normal key handling
+                            continue;
                         }
-                        // Ignore other keys while permission prompt is active
                         continue;
                     }
 
-                    // Route via keybinding system
                     use crate::keybindings::{resolve_key, KeybindingAction, KeybindingContext};
-                    let active_contexts = vec![
-                        KeybindingContext::Global,
-                        KeybindingContext::Chat,
-                    ];
-                    if let Some(action) = resolve_key(
-                        &key,
-                        &active_contexts,
-                        &self.bindings,
-                    ) {
+                    let active_contexts =
+                        vec![KeybindingContext::Global, KeybindingContext::Chat];
+                    if let Some(action) =
+                        resolve_key(&key, &active_contexts, &self.bindings)
+                    {
                         match action {
                             KeybindingAction::AppInterrupt | KeybindingAction::AppExit => {
                                 self.exit = true;
                             }
-                            KeybindingAction::AppRedraw => {
-                                // Handled automatically by terminal.draw above
-                            }
+                            KeybindingAction::AppRedraw => {}
                             KeybindingAction::ChatSubmit => {
                                 let submitted = self.input.trim().to_string();
                                 if submitted == "quit" || submitted == "exit" {
                                     self.exit = true;
+                                } else if submitted.starts_with('/') {
+                                    self.handle_slash_command(&submitted);
+                                    self.input.clear();
                                 } else if !submitted.is_empty() {
-                                    self.messages.push(format!("You: {}", submitted));
-
-                                    // Send query to engine thread
+                                    self.messages.push(MessageEntry::Divider);
+                                    self.messages
+                                        .push(MessageEntry::User(submitted.clone()));
                                     let _ = self.tx_to_engine.send(submitted).await;
                                     self.input.clear();
                                     self.auto_scroll();
@@ -217,22 +254,12 @@ impl App {
                             KeybindingAction::ChatCancel => {
                                 self.input.clear();
                             }
-                            KeybindingAction::HistoryPrevious => {
-                                // TODO: Command history
-                            }
-                            KeybindingAction::HistoryNext => {
-                                // TODO: Command history
-                            }
-                            _ => {
-                                // Other actions not yet handled
-                            }
+                            KeybindingAction::HistoryPrevious | KeybindingAction::HistoryNext => {}
+                            _ => {}
                         }
                     } else {
-                        // Fallback text input
                         match key.code {
-                            KeyCode::Char(c) => {
-                                self.input.push(c);
-                            }
+                            KeyCode::Char(c) => self.input.push(c),
                             KeyCode::Backspace => {
                                 self.input.pop();
                             }
@@ -241,87 +268,312 @@ impl App {
                     }
                 }
             } else {
-                // Render tick
                 self.frame_ticker = self.frame_ticker.wrapping_add(1);
             }
         }
         Ok(())
     }
 
-    /// Auto-scroll to show the latest content.
     fn auto_scroll(&mut self) {
-        let total_lines: usize = self.messages.iter().map(|m| m.lines().count().max(1)).sum();
-        if let Some(ref stream) = self.current_stream {
-            let stream_lines = stream.lines().count().max(1);
-            self.scroll_offset = (total_lines + stream_lines).saturating_sub(10) as u16;
-        } else {
-            self.scroll_offset = total_lines.saturating_sub(10) as u16;
+        let total_lines: usize = self
+            .messages
+            .iter()
+            .map(|m| self.entry_line_count(m))
+            .sum();
+        let stream_lines = self
+            .current_stream
+            .as_ref()
+            .map(|s| s.lines().count().max(1) + 1)
+            .unwrap_or(0);
+        self.scroll_offset = (total_lines + stream_lines).saturating_sub(10) as u16;
+    }
+
+    fn entry_line_count(&self, entry: &MessageEntry) -> usize {
+        match entry {
+            MessageEntry::User(t) | MessageEntry::Assistant(t) | MessageEntry::Error(t) => {
+                t.lines().count().max(1)
+            }
+            MessageEntry::System(t) => t.lines().count().max(1),
+            MessageEntry::ToolUse { .. } => 1,
+            MessageEntry::Divider => 1,
+            MessageEntry::Permission { .. } => 2,
         }
     }
 
-    /// Renders the two-panel layout: scrollable conversation history on top, input prompt on bottom.
+    fn handle_slash_command(&mut self, cmd: &str) {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let command = parts.first().copied().unwrap_or("");
+
+        match command {
+            "/help" => {
+                self.messages.push(MessageEntry::System(
+                    "  /help  - Show this help\n  /clear - Clear conversation\n  /cost  - Show token usage and cost\n  /exit  - Exit the agent".to_string(),
+                ));
+            }
+            "/clear" => {
+                self.messages.clear();
+                self.scroll_offset = 0;
+                self.messages
+                    .push(MessageEntry::System("  Conversation cleared.".to_string()));
+            }
+            "/cost" => {
+                if let Some(ref tracker) = self.cost_tracker {
+                    if let Ok(t) = tracker.lock() {
+                        self.messages
+                            .push(MessageEntry::System(format!("  {}", t.format_total_cost())));
+                    }
+                } else {
+                    self.messages.push(MessageEntry::System(
+                        "  Cost tracking not available.".to_string(),
+                    ));
+                }
+            }
+            "/exit" | "/quit" => {
+                self.exit = true;
+            }
+            _ => {
+                self.messages.push(MessageEntry::System(format!(
+                    "  Unknown command: {}",
+                    command
+                )));
+            }
+        }
+        self.auto_scroll();
+    }
+
+    // ── Rendering ────────────────────────────────────────────────────────
+
     fn ui(&self, f: &mut Frame) {
+        let area = f.size();
+
+        // Layout: [conversation] [status line] [prompt]
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .margin(1)
             .constraints([
-                Constraint::Min(5),    // Messages area
-                Constraint::Length(3), // Input area
+                Constraint::Min(3),    // conversation
+                Constraint::Length(1), // status line
+                Constraint::Length(1), // prompt input
             ])
-            .split(f.size());
+            .split(area);
 
-        // Build display lines: finalized messages + streaming text
+        self.render_conversation(f, chunks[0]);
+        self.render_status_line(f, chunks[1]);
+        self.render_prompt(f, chunks[2]);
+    }
+
+    fn render_conversation(&self, f: &mut Frame, area: Rect) {
+        let w = area.width.saturating_sub(2) as usize; // padding
+        let dim = Style::default().fg(Color::DarkGray);
         let mut lines: Vec<Line> = Vec::new();
-        for msg in &self.messages {
-            for line in msg.lines() {
-                lines.push(Line::from(Span::raw(line.to_string())));
+
+        for entry in &self.messages {
+            match entry {
+                MessageEntry::User(text) => {
+                    for line in text.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{} ", PROMPT_CHAR),
+                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                        ]));
+                    }
+                }
+                MessageEntry::Assistant(text) => {
+                    for (i, line) in text.lines().enumerate() {
+                        let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), dim),
+                            Span::raw(line.to_string()),
+                        ]));
+                    }
+                }
+                MessageEntry::ToolUse { name, done, error } => {
+                    let (dot_style, name_style) = if *error {
+                        (
+                            Style::default().fg(Color::Red),
+                            Style::default().fg(Color::Red),
+                        )
+                    } else if *done {
+                        (
+                            Style::default().fg(Color::Green),
+                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        // blinking dim dot for in-progress
+                        let vis = if self.frame_ticker % 10 < 5 {
+                            Style::default().fg(Color::DarkGray)
+                        } else {
+                            Style::default().fg(Color::Black)
+                        };
+                        (vis, Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(DOT, dot_style),
+                        Span::raw(" "),
+                        Span::styled(name.clone(), name_style),
+                    ]));
+                }
+                MessageEntry::Error(text) => {
+                    for line in text.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled(ASSISTANT_PREFIX.to_string(), dim),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default().fg(Color::Red),
+                            ),
+                        ]));
+                    }
+                }
+                MessageEntry::System(text) => {
+                    for line in text.lines() {
+                        lines.push(Line::from(Span::styled(line.to_string(), dim)));
+                    }
+                }
+                MessageEntry::Divider => {
+                    let divider: String =
+                        std::iter::repeat(DIVIDER_CHAR).take(w.min(80)).collect();
+                    lines.push(Line::from(Span::styled(divider, dim)));
+                }
+                MessageEntry::Permission {
+                    tool_name,
+                    description,
+                } => {
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", dim),
+                        Span::styled(
+                            tool_name.clone(),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!(" - {}", description),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        "  Allow? (y)es / (n)o / (a)lways",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
             }
         }
 
-        // Show streaming text with a cursor indicator
+        // Streaming text
         if let Some(ref stream) = self.current_stream {
             if !stream.is_empty() {
-                for line in stream.lines() {
+                for (i, line) in stream.lines().enumerate() {
+                    let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
                     lines.push(Line::from(vec![
-                        Span::styled("Agent: ", Style::default().fg(Color::Green)),
+                        Span::styled(prefix.to_string(), dim),
                         Span::raw(line.to_string()),
                     ]));
                 }
             }
-            // Blinking cursor at end
-            let cursor = if self.frame_ticker % 10 < 5 { "▌" } else { " " };
-            lines.push(Line::from(Span::styled(cursor, Style::default().fg(Color::Green))));
+            // Blinking cursor
+            let cursor = if self.frame_ticker % 10 < 5 {
+                "\u{2588}" // full block
+            } else {
+                " "
+            };
+            let last_idx = lines.len().saturating_sub(1);
+            if let Some(last) = lines.get_mut(last_idx) {
+                last.spans.push(Span::styled(
+                    cursor.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    cursor.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
 
-        let messages_block = Paragraph::new(lines)
-            .block(Block::default().title(" Conversation ").borders(Borders::ALL))
+        let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((self.scroll_offset, 0));
 
-        f.render_widget(messages_block, chunks[0]);
+        f.render_widget(para, area);
+    }
 
-        // Command Input UI
-        let mut input_display = self.input.clone();
-        if self.pending_permission.is_some() {
-            input_display = "Press Y to allow, N to deny, A to always allow".to_string();
-        } else if let Some(ref tool) = self.running_tool {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let spinner = frames[self.frame_ticker % frames.len()];
-            input_display = format!("{}  [ {} {} ]", input_display, spinner, tool);
-        }
+    fn render_status_line(&self, f: &mut Frame, area: Rect) {
+        let dim = Style::default().fg(Color::DarkGray);
+        let w = area.width as usize;
 
-        let input_color = if self.pending_permission.is_some() {
-            Color::Red
-        } else if self.running_tool.is_some() || self.current_stream.is_some() {
-            Color::Cyan
+        // Left: model/tool status
+        let left = if let Some(ref tool) = self.running_tool {
+            format!(" {} ...", tool)
+        } else if self.current_stream.is_some() {
+            " streaming...".to_string()
         } else {
-            Color::Yellow
+            String::new()
         };
 
-        let input_text = Paragraph::new(input_display.as_str())
-            .style(Style::default().fg(input_color))
-            .block(Block::default().title(" > ").borders(Borders::ALL));
+        // Right: cost if available
+        let right = if let Some(ref tracker) = self.cost_tracker {
+            if let Ok(t) = tracker.lock() {
+                if t.total_cost_usd > 0.0 {
+                    format!("${:.4} ", t.total_cost_usd)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
 
-        f.render_widget(input_text, chunks[1]);
+        let fill_len = w.saturating_sub(left.len() + right.len());
+        let fill: String = std::iter::repeat(DIVIDER_CHAR).take(fill_len).collect();
+
+        let line = Line::from(vec![
+            Span::styled(left, dim),
+            Span::styled(fill, dim),
+            Span::styled(right, dim),
+        ]);
+
+        f.render_widget(Paragraph::new(vec![line]), area);
+    }
+
+    fn render_prompt(&self, f: &mut Frame, area: Rect) {
+        if self.pending_permission.is_some() {
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{} ", PROMPT_CHAR),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(
+                    "Allow? (y)es / (n)o / (a)lways",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(vec![line]), area);
+        } else {
+            let cursor_vis = if self.frame_ticker % 10 < 5 {
+                "\u{2588}" // full block cursor
+            } else {
+                " "
+            };
+
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{} ", PROMPT_CHAR),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(self.input.clone()),
+                Span::styled(
+                    cursor_vis.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            f.render_widget(Paragraph::new(vec![line]), area);
+        }
     }
 }
