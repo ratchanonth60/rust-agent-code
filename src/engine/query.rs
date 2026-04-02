@@ -366,7 +366,7 @@ impl QueryEngine {
 
             let api_start = Instant::now();
             let response = self.http_client
-                .post(url)
+                .post(&url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
                 .json(&request_body)
@@ -392,7 +392,23 @@ impl QueryEngine {
                 }
             }
 
-            let msg = &resp["choices"][0]["message"];
+            let choices = resp["choices"]
+                .as_array()
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Gemini response missing or empty 'choices' array. Response: {}",
+                        resp
+                    )
+                })?;
+            let msg = choices[0]
+                .get("message")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Gemini response choices[0] missing 'message' field. Response: {}",
+                        resp
+                    )
+                })?;
             let content     = msg["content"].as_str().unwrap_or("").to_string();
             let thought_sig = msg["extra_content"]["google"]["thought_signature"]
                 .as_str().map(String::from);
