@@ -3,6 +3,10 @@ pub mod edit;
 pub mod fs;
 pub mod glob_tool;
 pub mod grep_tool;
+pub mod todo;
+pub mod sleep;
+pub mod web_fetch;
+pub mod ask_user;
 
 use async_trait::async_trait;
 use serde_json::Value;

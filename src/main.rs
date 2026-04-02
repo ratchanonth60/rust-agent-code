@@ -6,6 +6,7 @@ pub mod mem;
 pub mod keybindings;
 pub mod output_styles;
 pub mod permissions;
+pub mod context;
 
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -185,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
         // Enter interactive Ratatui mode
         let mut terminal = ui::setup_terminal()?;
         let mut app = ui::app::App::new(tx_to_engine, rx_to_ui);
+        app.cost_tracker = Some(cost_tracker.clone());
 
         let app_result = app.run(&mut terminal).await;
 

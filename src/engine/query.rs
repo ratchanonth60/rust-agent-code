@@ -20,6 +20,8 @@ use crate::permissions::{PermissionDecision, PermissionRule, check_permission};
 use crate::tools::{
     fs::ReadFileTool, fs::WriteFileTool, bash::BashTool,
     edit::FileEditTool, glob_tool::GlobTool, grep_tool::GrepTool,
+    todo::TodoWriteTool, sleep::SleepTool, web_fetch::WebFetchTool,
+    ask_user::AskUserQuestionTool,
     Tool, ToolContext,
 };
 
@@ -43,6 +45,8 @@ pub struct QueryEngine {
     pub permission_rules: Arc<Mutex<Vec<PermissionRule>>>,
     /// Working directory for path safety checks.
     pub cwd: std::path::PathBuf,
+    /// Shared todo list state.
+    pub todo_list: crate::tools::todo::SharedTodoList,
 }
 
 impl QueryEngine {
@@ -94,6 +98,8 @@ impl QueryEngine {
             }
         };
 
+        let todo_list = crate::tools::todo::new_shared_todo_list();
+
         let tools: Vec<Box<dyn Tool + Send + Sync>> = vec![
             Box::new(ReadFileTool),
             Box::new(WriteFileTool),
@@ -101,6 +107,10 @@ impl QueryEngine {
             Box::new(FileEditTool),
             Box::new(GlobTool),
             Box::new(GrepTool),
+            Box::new(TodoWriteTool { todos: todo_list.clone() }),
+            Box::new(SleepTool),
+            Box::new(WebFetchTool),
+            Box::new(AskUserQuestionTool::new(None)), // TUI channel wired later if needed
         ];
 
         Ok(Self {
@@ -113,6 +123,7 @@ impl QueryEngine {
             cost_tracker: Arc::new(Mutex::new(CostTracker::new())),
             permission_rules: Arc::new(Mutex::new(Vec::new())),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            todo_list,
         })
     }
 
@@ -226,11 +237,18 @@ impl QueryEngine {
         // 1. Build the system memory prompt that teaches the Agent how to remember.
         // This is equivalent to TS `buildMemoryLines()`.
         let mut system_prompt = crate::mem::build_memory_prompt();
-        
+
         // 1.5 Inject Output Styles from user's Markdown definitions
         // This maps to TS `loadOutputStylesDir.ts`.
         let output_styles = crate::output_styles::build_styles_prompt();
         system_prompt.push_str(&output_styles);
+
+        // 1.6 Inject context (CLAUDE.md, git status, system info)
+        let context_prompt = crate::context::build_context_prompt(&self.cwd);
+        if !context_prompt.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&context_prompt);
+        }
         
         // 3. Setup ToolContext driven by EngineConfig
         let tool_names = self.tools.iter().map(|t| t.name().to_string()).collect();

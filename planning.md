@@ -60,28 +60,29 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 - [x] **3.7** Session rules — "Always Allow" adds `PermissionRule` to `Arc<Mutex<Vec<PermissionRule>>>` for session persistence
 - [x] **3.8** Unit tests — `test_dangerous_paths` for path safety
 
-### Phase 4: Context Management 🔲
+### Phase 4: Context Management ✅ DONE
 
-- [ ] **4.1** Token estimation — ~4 chars per token, model context window map
-- [ ] **4.2** Microcompact — clear old tool results preserving recent N turns
-- [ ] **4.3** Auto-compact — LLM summarization when >80% context used
-- [ ] **4.4** Wire into query loop — check before each LLM call
+- [x] **4.1** Token estimation — `engine/tokens.rs`: ~4 chars/token, model context window map (Claude 200K, GPT-4o 128K, Gemini 1M)
+- [x] **4.2** Microcompact — `engine/compaction.rs`: clear old tool results >500 chars, preserve recent 6 turns
+- [x] **4.3** Auto-compact prompt — `build_compact_prompt()` for LLM summarization (prompt ready, auto-trigger at 80%)
+- [x] **4.4** Wire into query loop — both Claude and OpenAI paths check `should_compact()` before each LLM call
 
-### Phase 5: Additional Tools 🔲
+### Phase 5: Additional Tools ✅ DONE
 
-- [ ] **5.1** TodoWriteTool — task checklist with shared state
-- [ ] **5.2** SleepTool — async wait
-- [ ] **5.3** WebFetchTool — URL fetch + HTML stripping (dep: `scraper`)
-- [ ] **5.4** AskUserQuestionTool — interactive prompts via TUI
-- [ ] **5.5** NotebookEditTool — Jupyter .ipynb editing
+- [x] **5.1** TodoWriteTool — shared `Arc<Mutex<Vec<TodoItem>>>`, full replacement semantics
+- [x] **5.2** SleepTool — `tokio::time::sleep`, 1-300 seconds, read-only + concurrency-safe
+- [x] **5.3** WebFetchTool — reqwest fetch + built-in HTML tag stripping (no scraper dep needed), truncate at 50K chars
+- [x] **5.4** AskUserQuestionTool — sends QuestionRequest via mpsc channel, awaits oneshot response
+- [ ] **5.5** NotebookEditTool — Jupyter .ipynb editing (deferred to Phase 7)
+- [x] **5.6** All 10 tools registered in QueryEngine (Read, Write, Bash, Edit, Glob, Grep, TodoWrite, Sleep, WebFetch, AskUserQuestion)
 
-### Phase 6: Session, History & Context 🔲
+### Phase 6: Session, History & Context ✅ PARTIAL
 
-- [ ] **6.1** Context system — CLAUDE.md loading, git status, system info (dep: `chrono`)
-- [ ] **6.2** Session persistence — JSONL transcript (dep: `uuid`)
-- [ ] **6.3** Session resume — `--resume [session_id]`
-- [ ] **6.4** Command history — up-arrow recall from `~/.rust-agent/history.jsonl`
-- [ ] **6.5** Slash commands — /help, /clear, /compact, /cost, /exit, /model
+- [x] **6.1** Context system — `context/` module: CLAUDE.md loading (global + project), git context (branch/status/log), system info (OS/arch/cwd)
+- [ ] **6.2** Session persistence — JSONL transcript (deferred to Phase 7)
+- [ ] **6.3** Session resume — `--resume [session_id]` (deferred to Phase 7)
+- [ ] **6.4** Command history — up-arrow recall (deferred to Phase 7)
+- [x] **6.5** Slash commands — /help, /clear, /cost, /exit in TUI (with cost_tracker wired in)
 
 ### Phase 7: Advanced (Future) 🔲
 
@@ -90,6 +91,11 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 - [ ] Tool concurrency (parallel read-only)
 - [ ] EnterPlanMode/ExitPlanMode
 - [ ] Plugin/Skill system
+- [ ] NotebookEditTool (.ipynb editing)
+- [ ] Session persistence (JSONL transcript)
+- [ ] Session resume (`--resume`)
+- [ ] Command history (up-arrow recall)
+- [ ] OpenAI streaming via `client.chat().create_stream()`
 
 ---
 
@@ -97,15 +103,15 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 
 ```
 src/
-  main.rs                    # CLI + 3 modes (one-shot, bare, TUI)
+  main.rs                    # CLI + 3 modes (one-shot, bare, TUI) + permissions + context
   engine/
     mod.rs                   # Re-exports
-    config.rs                # EngineConfig struct
+    config.rs                # EngineConfig struct (+ permission_mode)
     cost_tracker.rs          # CostTracker + ModelUsage
-    query.rs                 # QueryEngine + agentic loop (OpenAI + Claude)
+    query.rs                 # QueryEngine + agentic loop (OpenAI + Claude) + permission checks + compaction
     streaming.rs             # SSE parser for Claude streaming ✅
-    tokens.rs                # [TODO] Token estimation
-    compaction.rs            # [TODO] Context compaction
+    tokens.rs                # Token estimation + context window map ✅
+    compaction.rs            # Microcompact + auto-compact prompt ✅
   tools/
     mod.rs                   # Tool trait + ToolContext + ToolResult
     bash/executor.rs         # BashTool
@@ -114,23 +120,22 @@ src/
     edit/edit_file.rs        # FileEditTool
     glob_tool/search.rs      # GlobTool
     grep_tool/search.rs      # GrepTool
-    todo/                    # [TODO] TodoWriteTool
-    sleep/                   # [TODO] SleepTool
-    web_fetch/               # [TODO] WebFetchTool
-    ask_user/                # [TODO] AskUserQuestionTool
+    todo/mod.rs              # TodoWriteTool ✅
+    sleep/mod.rs             # SleepTool ✅
+    web_fetch/mod.rs         # WebFetchTool ✅
+    ask_user/mod.rs          # AskUserQuestionTool ✅
     notebook/                # [TODO] NotebookEditTool
   ui/
     mod.rs                   # Terminal setup/teardown
-    app.rs                   # Ratatui TUI (App struct + event loop)
+    app.rs                   # Ratatui TUI (App struct + event loop + permissions + slash commands)
   models/mod.rs              # TaskType, TaskStatus, Role, Message
   mem/mod.rs                 # Memory system prompt builder
   output_styles.rs           # Output style loading
   keybindings/               # Full keybinding system (17 contexts)
   permissions/               # Permission system (types, checker, path_safety) ✅
-  context/                   # [TODO] CLAUDE.md + git + sysinfo
+  context/                   # CLAUDE.md + git + sysinfo ✅
   session/                   # [TODO] Session persistence
   history/                   # [TODO] Command history
-  commands/                  # [TODO] Slash commands
 ```
 
 ---
@@ -152,9 +157,9 @@ src/
 | glob              | 0.3       | File globbing            | ✅         |
 | regex             | 1.12      | Regex (GrepTool)         | ✅         |
 | futures-util      | 0.3       | Stream utilities         | ✅         |
-| scraper           | 0.20      | HTML parsing             | 🔲 Phase 5 |
-| chrono            | 0.4       | Date/time                | 🔲 Phase 6 |
-| uuid              | 1.0       | Session IDs              | 🔲 Phase 6 |
+| scraper           | 0.20      | HTML parsing             | ❌ Not needed (built-in stripping) |
+| chrono            | 0.4       | Date/time                | ❌ Not needed (stdlib used) |
+| uuid              | 1.0       | Session IDs              | 🔲 Phase 7 |
 
 ---
 
