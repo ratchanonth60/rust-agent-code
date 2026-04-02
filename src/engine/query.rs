@@ -95,12 +95,16 @@ impl QueryEngine {
                 });
 
                 if resolved_api_key.is_empty() {
-                    let env_var = match provider {
+                    let env_var_desc = match provider {
                         ModelProvider::OpenAI => "OPENAI_API_KEY",
-                        ModelProvider::OpenAICompatible => "OPENAI_COMPAT_API_KEY",
+                        ModelProvider::OpenAICompatible => "OPENAI_COMPAT_API_KEY, OPENAI_API_KEY, or LLM_API_KEY",
                         _ => unreachable!(),
                     };
-                    return Err(anyhow!("{} is required for {:?} provider", env_var, provider));
+                    return Err(anyhow!(
+                        "Environment variable(s) {} required for {:?} provider",
+                        env_var_desc,
+                        provider
+                    ));
                 }
 
                 config = config.with_api_key(resolved_api_key);
