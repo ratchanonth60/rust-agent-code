@@ -1,106 +1,109 @@
+//! Context compaction for managing conversation length.
+//!
+//! When the conversation approaches the model's context window limit,
+//! old tool results are replaced with short placeholders to reclaim
+//! tokens without losing the conversation structure.
+
 use serde_json::Value;
 
-/// Tool names whose results can be cleared during microcompact.
-const CLEARABLE_TOOLS: &[&str] = &["Read", "Bash", "Grep", "Glob", "Edit", "Write"];
+/// Byte-length threshold for clearing a tool result block.
+///
+/// Results shorter than this are kept intact — the compaction overhead
+/// would not be worth the token savings.
+const CLEAR_THRESHOLD: usize = 500;
 
-/// Microcompact: replace old tool result content with a short summary.
+/// Placeholder text inserted in place of cleared tool results.
+const CLEARED_MARKER: &str = "[Cleared: tool result]";
+
+/// Replaces large tool-result blocks in **Claude-format** messages.
 ///
-/// Keeps the most recent `keep_recent` turns intact. Older tool_result
-/// blocks are replaced with `[Cleared: <tool_name> result]`.
+/// Messages older than the most recent `keep_recent` turns have their
+/// `tool_result` content replaced with [`CLEARED_MARKER`] when the
+/// original content exceeds [`CLEAR_THRESHOLD`] bytes.
 ///
-/// Works on Claude-format messages (Vec of {role, content: [blocks]}).
-pub fn microcompact(messages: &mut Vec<Value>, keep_recent: usize) {
-    if messages.len() <= keep_recent {
+/// # Arguments
+///
+/// * `messages` — mutable slice of Claude-format JSON messages
+/// * `keep_recent` — number of recent messages to leave untouched
+pub fn microcompact(messages: &mut [Value], keep_recent: usize) {
+    let len = messages.len();
+    if len <= keep_recent {
         return;
     }
+    let cutoff = len - keep_recent;
 
-    let cutoff = messages.len().saturating_sub(keep_recent);
-
-    for msg in messages[..cutoff].iter_mut() {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        if role != "user" {
+    for msg in &mut messages[..cutoff] {
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
             continue;
         }
-
-        if let Some(content) = msg.get_mut("content") {
-            if let Some(blocks) = content.as_array_mut() {
-                for block in blocks.iter_mut() {
-                    let block_type = block
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-
-                    if block_type == "tool_result" {
-                        // Check if the tool_use_id hints at a clearable tool
-                        // or just clear all old tool results
-                        let current_content = block
-                            .get("content")
-                            .and_then(|c| c.as_str())
-                            .unwrap_or("");
-
-                        // Only clear if content is large enough to be worth it
-                        if current_content.len() > 500 {
-                            block.as_object_mut().map(|obj| {
-                                obj.insert(
-                                    "content".to_string(),
-                                    Value::String("[Cleared: tool result]".to_string()),
-                                );
-                            });
-                        }
-                    }
+        let Some(blocks) = msg.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in blocks.iter_mut() {
+            let is_tool_result = block
+                .get("type")
+                .and_then(Value::as_str)
+                == Some("tool_result");
+            if !is_tool_result {
+                continue;
+            }
+            let large = block
+                .get("content")
+                .and_then(Value::as_str)
+                .map_or(false, |c| c.len() > CLEAR_THRESHOLD);
+            if large {
+                if let Some(obj) = block.as_object_mut() {
+                    obj.insert("content".into(), Value::String(CLEARED_MARKER.into()));
                 }
             }
         }
     }
 }
 
-/// Build the summarization prompt for auto-compact.
+/// Replaces large tool responses in **OpenAI-format** messages.
+///
+/// Works identically to [`microcompact`] but targets `role: "tool"`
+/// messages used by the OpenAI chat-completion API.
+pub fn microcompact_openai(messages: &mut [Value], keep_recent: usize) {
+    let len = messages.len();
+    if len <= keep_recent {
+        return;
+    }
+    let cutoff = len - keep_recent;
+
+    for msg in &mut messages[..cutoff] {
+        if msg.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let large = msg
+            .get("content")
+            .and_then(Value::as_str)
+            .map_or(false, |c| c.len() > CLEAR_THRESHOLD);
+        if large {
+            if let Some(obj) = msg.as_object_mut() {
+                obj.insert("content".into(), Value::String(CLEARED_MARKER.into()));
+            }
+        }
+    }
+}
+
+/// Builds a summarisation prompt for LLM-based auto-compaction.
+///
+/// The returned string can be sent to the LLM to produce a concise
+/// summary of the conversation so far, preserving key decisions,
+/// file paths, errors, and remaining tasks.
 pub fn build_compact_prompt(messages_json: &str) -> String {
     format!(
         "You are summarizing a conversation between a user and an AI coding assistant. \
-        Preserve the following in your summary:\n\
-        - Key decisions and conclusions reached\n\
-        - Important file paths and code changes made\n\
-        - Current task and what remains to be done\n\
-        - Any errors encountered and their resolution\n\
-        - User preferences expressed during the conversation\n\n\
-        Be concise but thorough. Output only the summary, no preamble.\n\n\
-        Conversation to summarize:\n{}\n",
-        messages_json
+         Preserve the following in your summary:\n\
+         - Key decisions and conclusions reached\n\
+         - Important file paths and code changes made\n\
+         - Current task and what remains to be done\n\
+         - Any errors encountered and their resolution\n\
+         - User preferences expressed during the conversation\n\n\
+         Be concise but thorough. Output only the summary, no preamble.\n\n\
+         Conversation to summarize:\n{messages_json}\n"
     )
-}
-
-/// Compact OpenAI-format messages (Vec<ChatCompletionRequestMessage> serialized as JSON).
-///
-/// For OpenAI format, we clear old assistant tool_calls arguments and old
-/// tool response content when they exceed a length threshold.
-pub fn microcompact_openai(messages: &mut Vec<Value>, keep_recent: usize) {
-    if messages.len() <= keep_recent {
-        return;
-    }
-
-    let cutoff = messages.len().saturating_sub(keep_recent);
-
-    for msg in messages[..cutoff].iter_mut() {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-
-        match role {
-            "tool" => {
-                // Clear old tool response content if large
-                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-                    if content.len() > 500 {
-                        msg.as_object_mut().map(|obj| {
-                            obj.insert(
-                                "content".to_string(),
-                                Value::String("[Cleared: tool result]".to_string()),
-                            );
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]
@@ -109,61 +112,37 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_microcompact_clears_old_large_results() {
-        let large_content = "x".repeat(1000);
-        let mut messages = vec![
-            json!({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "abc",
-                        "content": large_content
-                    }
-                ]
-            }),
-            json!({
-                "role": "assistant",
-                "content": [{"type": "text", "text": "ok"}]
-            }),
-            json!({
-                "role": "user",
-                "content": [{"type": "text", "text": "next question"}]
-            }),
+    fn clears_old_large_tool_results() {
+        let large = "x".repeat(1000);
+        let mut msgs = vec![
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": large}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "next"}]}),
         ];
-
-        microcompact(&mut messages, 2);
-
-        let cleared = messages[0]["content"][0]["content"].as_str().unwrap();
-        assert_eq!(cleared, "[Cleared: tool result]");
+        microcompact(&mut msgs, 2);
+        assert_eq!(msgs[0]["content"][0]["content"].as_str().unwrap(), CLEARED_MARKER);
     }
 
     #[test]
-    fn test_microcompact_keeps_small_results() {
-        let mut messages = vec![
-            json!({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": "abc",
-                        "content": "small result"
-                    }
-                ]
-            }),
-            json!({
-                "role": "assistant",
-                "content": [{"type": "text", "text": "ok"}]
-            }),
-            json!({
-                "role": "user",
-                "content": [{"type": "text", "text": "next"}]
-            }),
+    fn keeps_small_tool_results() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "small"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "ok"}]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "next"}]}),
         ];
+        microcompact(&mut msgs, 2);
+        assert_eq!(msgs[0]["content"][0]["content"].as_str().unwrap(), "small");
+    }
 
-        microcompact(&mut messages, 2);
-
-        let content = messages[0]["content"][0]["content"].as_str().unwrap();
-        assert_eq!(content, "small result"); // unchanged
+    #[test]
+    fn openai_clears_large_tool_messages() {
+        let large = "y".repeat(1000);
+        let mut msgs = vec![
+            json!({"role": "tool", "content": large, "tool_call_id": "t1"}),
+            json!({"role": "assistant", "content": "noted"}),
+            json!({"role": "user", "content": "what next?"}),
+        ];
+        microcompact_openai(&mut msgs, 2);
+        assert_eq!(msgs[0]["content"].as_str().unwrap(), CLEARED_MARKER);
     }
 }

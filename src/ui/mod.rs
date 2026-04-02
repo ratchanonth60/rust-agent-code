@@ -1,3 +1,8 @@
+//! Terminal UI setup and teardown (crossterm + ratatui).
+//!
+//! Call [`setup_terminal`] to enter the alternate screen and raw mode,
+//! and [`restore_terminal`] (or the panic hook) to leave it cleanly.
+
 pub mod app;
 
 use anyhow::Result;
@@ -9,7 +14,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{stdout, Stdout};
 
-/// Setup the terminal for a TUI application
+/// Enters the alternate screen and enables raw mode.
+///
+/// Installs a panic hook that restores the terminal before the
+/// default handler runs, preventing garbled output on crash.
 pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     // Save original panic hook
     let original_hook = std::panic::take_hook();
@@ -29,7 +37,7 @@ pub fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(terminal)
 }
 
-/// Restore the terminal back to its original state
+/// Leaves the alternate screen and disables raw mode.
 pub fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
     stdout().execute(LeaveAlternateScreen)?;

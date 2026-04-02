@@ -1,3 +1,5 @@
+//! [`FileEditTool`] — performs exact string replacements in files.
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -87,8 +89,8 @@ impl Tool for FileEditTool {
         // Empty old_string → create new file
         if old_string.is_empty() {
             if path.exists() {
-                let existing = std::fs::read_to_string(path).unwrap_or_default();
-                if !existing.is_empty() {
+                let existing = std::fs::read_to_string(path)?;
+                if !existing.trim().is_empty() {
                     return Ok(ToolResult::err(json!({
                         "error": "Cannot create new file - file already exists with content."
                     })));
@@ -132,27 +134,16 @@ impl Tool for FileEditTool {
             })));
         }
 
-        // Apply replacement
-        let updated = if replace_all {
-            content.replace(old_string, new_string)
-        } else {
-            content.replacen(old_string, new_string, 1)
-        };
-
-        // When deleting text, also consume the trailing newline if present
+        // When deleting, prefer also consuming any trailing newline
         let updated = if new_string.is_empty() && !old_string.ends_with('\n') {
             let with_newline = format!("{}\n", old_string);
             if content.contains(&with_newline) {
-                if replace_all {
-                    content.replace(&with_newline, "")
-                } else {
-                    content.replacen(&with_newline, "", 1)
-                }
+                apply_replace(&content, &with_newline, "", replace_all)
             } else {
-                updated
+                apply_replace(&content, old_string, new_string, replace_all)
             }
         } else {
-            updated
+            apply_replace(&content, old_string, new_string, replace_all)
         };
 
         std::fs::write(path, &updated)?;
@@ -162,4 +153,9 @@ impl Tool for FileEditTool {
             "message": format!("Edited file: {} ({} replacement(s))", file_path, if replace_all { match_count } else { 1 })
         })))
     }
+}
+
+/// Replaces `old` with `new` in `content` — all occurrences or just the first.
+fn apply_replace(content: &str, old: &str, new: &str, all: bool) -> String {
+    if all { content.replace(old, new) } else { content.replacen(old, new, 1) }
 }

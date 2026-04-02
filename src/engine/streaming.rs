@@ -1,3 +1,10 @@
+//! Claude Messages API Server-Sent Events (SSE) stream parser.
+//!
+//! Consumes the byte stream returned by the Messages API when
+//! `"stream": true` is set, emitting [`StreamEvent`]s for each
+//! content delta.  The parser also accumulates the full response into
+//! a [`StreamedResponse`] for use after the stream closes.
+
 use anyhow::Result;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -9,34 +16,51 @@ use tokio::sync::mpsc;
 pub enum StreamEvent {
     /// A chunk of text content from the model.
     TextDelta(String),
-    /// A tool_use block has started.
-    ToolUseStart { index: usize, id: String, name: String },
-    /// A chunk of JSON input for the current tool_use block.
+    /// A `tool_use` content block has started.
+    ToolUseStart {
+        /// Zero-based index of the content block.
+        index: usize,
+        /// Unique tool-use ID for correlating results.
+        id: String,
+        /// Name of the tool being invoked.
+        name: String,
+    },
+    /// A chunk of JSON input for the current `tool_use` block.
     ToolUseInputDelta(String),
-    /// The response is complete with optional usage info.
+    /// The response is complete; carries final token counts.
     MessageStop { input_tokens: u64, output_tokens: u64 },
     /// An error occurred during streaming.
     Error(String),
 }
 
-/// Accumulated tool use from streaming.
+/// A single tool invocation accumulated from streaming deltas.
 #[derive(Debug, Clone)]
 pub struct StreamedToolUse {
+    /// Unique tool-use ID assigned by the API.
     pub id: String,
+    /// Tool name (e.g. `"Bash"`, `"Read"`).
     pub name: String,
+    /// Raw JSON string of the tool input, assembled from
+    /// `input_json_delta` events.
     pub input_json: String,
 }
 
-/// Accumulated response from streaming.
+/// The fully accumulated response after an SSE stream completes.
 #[derive(Debug, Clone)]
 pub struct StreamedResponse {
+    /// Concatenated text output from all `text_delta` events.
     pub text: String,
+    /// Tool invocations extracted from `tool_use` content blocks.
     pub tool_uses: Vec<StreamedToolUse>,
+    /// Input tokens reported by the API (from `message_start`).
     pub input_tokens: u64,
+    /// Output tokens reported by the API (from `message_delta`).
     pub output_tokens: u64,
 }
 
-/// SSE event types from Claude API.
+// ── Internal SSE deserialization types ─────────────────────────────
+
+/// Top-level SSE `data:` payload from the Claude API.
 #[derive(Debug, Deserialize)]
 struct SseData {
     r#type: String,
@@ -59,6 +83,7 @@ struct ContentBlockStart {
     id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     text: Option<String>,
 }
@@ -70,6 +95,7 @@ struct DeltaBlock {
     text: Option<String>,
     #[serde(default)]
     partial_json: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     stop_reason: Option<String>,
 }

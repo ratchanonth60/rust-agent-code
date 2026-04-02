@@ -1,3 +1,5 @@
+//! [`BashTool`] implementation — spawns `bash -c` with timeout.
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;

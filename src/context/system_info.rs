@@ -1,6 +1,8 @@
+//! System information for the context prompt (OS, arch, shell, date).
+
 use std::path::Path;
 
-/// Get system information for the context prompt.
+/// Returns a human-readable summary of the runtime environment.
 pub fn get_system_info(cwd: &Path) -> String {
     let mut parts = Vec::new();
 

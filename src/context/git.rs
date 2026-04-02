@@ -1,7 +1,11 @@
+//! Git repository context — branch, status, recent commits.
+
 use std::path::Path;
 use std::process::Command;
 
-/// Get git context: branch, short status, recent commits.
+/// Collects git context: current branch, short status, and last 5 commits.
+///
+/// Returns an empty string if `cwd` is not inside a git repository.
 pub fn get_git_context(cwd: &Path) -> String {
     let mut parts = Vec::new();
 
@@ -30,6 +34,7 @@ pub fn get_git_context(cwd: &Path) -> String {
     parts.join("\n")
 }
 
+/// Runs a `git` command in `cwd` and returns trimmed stdout on success.
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
     Command::new("git")
         .args(args)

@@ -1,3 +1,14 @@
+//! Agentic query engine with multi-provider LLM support.
+//!
+//! [`QueryEngine`] is the core execution loop.  It sends a user query to
+//! an LLM, inspects the response for tool-use requests, dispatches them,
+//! feeds the results back, and repeats until the model produces a final
+//! text answer.
+//!
+//! Supported providers:
+//! - **Claude** — native Anthropic Messages API with SSE streaming
+//! - **OpenAI / Gemini / OpenAI-compatible** — via [`async_openai`]
+
 use anyhow::{anyhow, Context, Result};
 use async_openai::{
     config::OpenAIConfig,
@@ -25,6 +36,9 @@ use crate::tools::{
     Tool, ToolContext,
 };
 
+/// LLM provider selection.
+///
+/// Parsed from the `--provider` CLI flag via [`clap::ValueEnum`].
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ModelProvider {
     OpenAI,
@@ -33,6 +47,11 @@ pub enum ModelProvider {
     OpenAICompatible,
 }
 
+/// The central agentic engine that drives the tool-use loop.
+///
+/// Holds the LLM client(s), registered tools, cost tracker, and
+/// permission state.  Call [`QueryEngine::query`] to run a full
+/// agent turn (potentially multiple LLM round-trips).
 pub struct QueryEngine {
     provider: ModelProvider,
     openai_client: Option<Client<OpenAIConfig>>,
@@ -127,7 +146,7 @@ impl QueryEngine {
         })
     }
 
-    /// Helper to convert our Rust tools into OpenAI ChatCompletionTool format
+    /// Converts registered tools into the OpenAI function-calling schema.
     fn get_openai_tools(&self) -> Result<Vec<ChatCompletionTool>> {
         let mut ret = Vec::new();
         for tool in &self.tools {
@@ -147,12 +166,15 @@ impl QueryEngine {
         Ok(ret)
     }
 
+    /// Returns a reference to the OpenAI-compatible client, or an error
+    /// if the engine was configured for a non-OpenAI provider.
     fn get_openai_client(&self) -> Result<&Client<OpenAIConfig>> {
         self.openai_client
             .as_ref()
             .ok_or_else(|| anyhow!("OpenAI-compatible client is not configured for this provider"))
     }
 
+    /// Looks up a tool by name or alias.
     fn find_tool(&self, tool_name: &str) -> Option<&(dyn Tool + Send + Sync)> {
         self.tools.iter().find_map(|tool| {
             if tool.name() == tool_name || tool.aliases().into_iter().any(|alias| alias == tool_name) {
@@ -163,9 +185,12 @@ impl QueryEngine {
         })
     }
 
-    /// Check permission for a tool invocation. Returns Ok(true) if allowed, Ok(false) if denied.
-    /// When the decision is Ask and a TUI channel is available, sends a PermissionRequest and waits
-    /// for the user's response.
+    /// Checks permission for a tool invocation.
+    ///
+    /// Returns `Ok(true)` if allowed, `Ok(false)` if denied.
+    /// When the decision is [`PermissionDecision::Ask`] and a TUI channel
+    /// is available, sends a [`UiEvent::PermissionRequest`] and awaits
+    /// the user's interactive response.
     async fn check_tool_permission(
         &self,
         tool: &(dyn Tool + Send + Sync),
@@ -230,7 +255,12 @@ impl QueryEngine {
         }
     }
 
-    /// Executes the agent loop. It will call LLM, if tools are requested, it executes them and loops.
+    /// Runs the full agentic loop for a single user query.
+    ///
+    /// 1. Builds the system prompt (memory, output styles, context).
+    /// 2. Dispatches to the appropriate provider path.
+    /// 3. Loops: LLM call → tool dispatch → feed results → repeat.
+    /// 4. Returns the model's final text answer.
     pub async fn query(&self, input: &str, tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>) -> Result<String> {
         info!("Sending query to {:?} model: {}", self.provider, self.model);
         
@@ -268,6 +298,7 @@ impl QueryEngine {
         }
     }
 
+    /// OpenAI-compatible agentic loop (OpenAI, Gemini, and compatible providers).
     async fn query_openai_compatible(
         &self,
         input: &str,
@@ -423,6 +454,7 @@ impl QueryEngine {
         }
     }
 
+    /// Resolves the Anthropic API key from environment variables.
     fn get_claude_key(&self) -> String {
         std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("CLAUDE_API_KEY"))
@@ -430,10 +462,12 @@ impl QueryEngine {
             .unwrap_or_default()
     }
 
+    /// Returns the API base URL, defaulting to `https://api.anthropic.com`.
     fn get_claude_base(&self) -> String {
         std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string())
     }
 
+    /// Converts registered tools into the Claude tool definition format.
     fn get_claude_tools(&self) -> Vec<ClaudeToolDefinition> {
         self.tools
             .iter()
@@ -445,6 +479,9 @@ impl QueryEngine {
             .collect()
     }
 
+    /// Claude-native agentic loop (Anthropic Messages API).
+    ///
+    /// Supports both streaming (SSE) and non-streaming paths.
     async fn query_claude(
         &self,
         input: &str,
@@ -607,48 +644,8 @@ impl QueryEngine {
                 let mut tool_result_blocks = Vec::new();
                 for tu in &streamed.tool_uses {
                     let tool_input = parse_tool_input(&tu.input_json);
-                    if let Some(tool) = self.find_tool(&tu.name) {
-                        // Permission check
-                        let allowed = self.check_tool_permission(tool, &tool_input, &tx_ui).await?;
-                        if !allowed {
-                            tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                tool_use_id: tu.id.clone(),
-                                content: format!("Permission denied for tool '{}'.", tu.name),
-                                is_error: Some(true),
-                            });
-                            continue;
-                        }
-
-                        let exec_result = tool.call(tool_input, ctx).await;
-
-                        if let Some(ref tx) = tx_ui {
-                            let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(tu.name.clone())).await;
-                        }
-
-                        match exec_result {
-                            Ok(res) => {
-                                tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                    tool_use_id: tu.id.clone(),
-                                    content: serde_json::to_string(&res.output)
-                                        .unwrap_or_else(|_| "{}".to_string()),
-                                    is_error: if res.is_error { Some(true) } else { None },
-                                });
-                            }
-                            Err(e) => {
-                                tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                    tool_use_id: tu.id.clone(),
-                                    content: format!("Error executing tool: {}", e),
-                                    is_error: Some(true),
-                                });
-                            }
-                        }
-                    } else {
-                        tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                            tool_use_id: tu.id.clone(),
-                            content: format!("Error: Tool '{}' not found.", tu.name),
-                            is_error: Some(true),
-                        });
-                    }
+                    let block = self.execute_claude_tool(&tu.id, &tu.name, tool_input, ctx, &tx_ui).await?;
+                    tool_result_blocks.push(block);
                 }
 
                 messages.push(ClaudeMessage {
@@ -678,43 +675,8 @@ impl QueryEngine {
                 let mut tool_result_blocks = Vec::new();
                 for block in &api_response.content {
                     if let ClaudeContentBlock::ToolUse { id, name, input } = block {
-                        if let Some(tool) = self.find_tool(name) {
-                            // Permission check
-                            let allowed = self.check_tool_permission(tool, input, &tx_ui).await?;
-                            if !allowed {
-                                tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: format!("Permission denied for tool '{}'.", name),
-                                    is_error: Some(true),
-                                });
-                                continue;
-                            }
-
-                            let exec_result = tool.call(input.clone(), ctx).await;
-                            match exec_result {
-                                Ok(res) => {
-                                    tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: serde_json::to_string(&res.output)
-                                            .unwrap_or_else(|_| "{}".to_string()),
-                                        is_error: if res.is_error { Some(true) } else { None },
-                                    });
-                                }
-                                Err(e) => {
-                                    tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: format!("Error executing tool: {}", e),
-                                        is_error: Some(true),
-                                    });
-                                }
-                            }
-                        } else {
-                            tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: format!("Error: Tool '{}' not found.", name),
-                                is_error: Some(true),
-                            });
-                        }
+                        let result = self.execute_claude_tool(id, name, input.clone(), ctx, &tx_ui).await?;
+                        tool_result_blocks.push(result);
                     }
                 }
 
@@ -738,8 +700,59 @@ impl QueryEngine {
             }
         }
     }
+
+    /// Executes a single Claude tool call and returns a [`ClaudeContentBlock::ToolResult`].
+    ///
+    /// Shared by both the streaming and non-streaming Claude paths.
+    /// Handles permission checks, TUI notifications, and error wrapping.
+    async fn execute_claude_tool(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        tool_input: Value,
+        ctx: &ToolContext,
+        tx_ui: &Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+    ) -> Result<ClaudeContentBlock> {
+        let Some(tool) = self.find_tool(tool_name) else {
+            return Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Error: Tool '{}' not found.", tool_name),
+                is_error: Some(true),
+            });
+        };
+
+        let allowed = self.check_tool_permission(tool, &tool_input, tx_ui).await?;
+        if !allowed {
+            return Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Permission denied for tool '{}'.", tool_name),
+                is_error: Some(true),
+            });
+        }
+
+        let exec_result = tool.call(tool_input, ctx).await;
+        if let Some(ref tx) = tx_ui {
+            let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(tool_name.to_string())).await;
+        }
+
+        match exec_result {
+            Ok(res) => Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: serde_json::to_string(&res.output).unwrap_or_else(|_| "{}".to_string()),
+                is_error: if res.is_error { Some(true) } else { None },
+            }),
+            Err(e) => Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Error executing tool: {}", e),
+                is_error: Some(true),
+            }),
+        }
+    }
 }
 
+// ── Claude API wire types ──────────────────────────────────────────
+
+/// Tool definition in the Claude Messages API format.
 #[derive(Debug, Clone, Serialize)]
 struct ClaudeToolDefinition {
     name: String,
@@ -747,28 +760,34 @@ struct ClaudeToolDefinition {
     input_schema: Value,
 }
 
+/// Tool-choice selector (`"auto"` lets the model decide).
 #[derive(Debug, Clone, Serialize)]
 struct ClaudeToolChoice {
     r#type: String,
 }
 
+/// A single message in the Claude conversation history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClaudeMessage {
     role: String,
     content: Vec<ClaudeContentBlock>,
 }
 
+/// Content block variants used in Claude messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClaudeContentBlock {
+    /// Plain text output from the model or user.
     Text {
         text: String,
     },
+    /// A tool invocation requested by the model.
     ToolUse {
         id: String,
         name: String,
         input: Value,
     },
+    /// The result of executing a tool, sent back to the model.
     ToolResult {
         tool_use_id: String,
         content: String,
@@ -777,6 +796,7 @@ enum ClaudeContentBlock {
     },
 }
 
+/// Request body for the Claude Messages API.
 #[derive(Debug, Clone, Serialize)]
 struct ClaudeMessagesRequest {
     model: String,
@@ -792,6 +812,7 @@ struct ClaudeMessagesRequest {
     stream: Option<bool>,
 }
 
+/// Response body from the Claude Messages API.
 #[derive(Debug, Clone, Deserialize)]
 struct ClaudeMessagesResponse {
     content: Vec<ClaudeContentBlock>,
@@ -799,51 +820,93 @@ struct ClaudeMessagesResponse {
     usage: Option<ClaudeUsage>,
 }
 
+/// Token usage reported by the Claude API.
 #[derive(Debug, Clone, Deserialize)]
 struct ClaudeUsage {
     #[serde(default)]
     input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    #[allow(dead_code)]
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    #[allow(dead_code)]
     #[serde(default)]
     cache_creation_input_tokens: Option<u64>,
 }
 
+// ── Cost calculation ───────────────────────────────────────────────
+
 /// Per-model pricing in USD per million tokens.
+#[derive(Clone, Copy)]
 struct ModelPricing {
     input_per_mtok: f64,
     output_per_mtok: f64,
 }
 
-fn get_model_pricing(model: &str) -> ModelPricing {
-    // Match model name patterns to pricing tiers
-    let model_lower = model.to_lowercase();
-    if model_lower.contains("opus") {
-        // Claude Opus 4/4.1: $15/$75
-        ModelPricing { input_per_mtok: 15.0, output_per_mtok: 75.0 }
-    } else if model_lower.contains("haiku") {
-        // Claude Haiku: $1/$5
-        ModelPricing { input_per_mtok: 1.0, output_per_mtok: 5.0 }
-    } else if model_lower.contains("sonnet") || model_lower.contains("claude") {
-        // Claude Sonnet: $3/$15
-        ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }
-    } else if model_lower.contains("gpt-4o-mini") {
-        ModelPricing { input_per_mtok: 0.15, output_per_mtok: 0.60 }
-    } else if model_lower.contains("gpt-4o") || model_lower.contains("gpt-4") {
-        ModelPricing { input_per_mtok: 2.50, output_per_mtok: 10.0 }
-    } else if model_lower.contains("gemini") {
-        // Gemini 2.5 Pro: free tier / $1.25/$10 for paid
-        ModelPricing { input_per_mtok: 1.25, output_per_mtok: 10.0 }
-    } else {
-        // Default: moderate pricing
-        ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }
-    }
+/// A row in the static pricing lookup table.
+struct PricingEntry {
+    /// Required substring (lowercased) in the model name.
+    primary: &'static str,
+    /// Optional second substring; both must match when set.
+    secondary: Option<&'static str>,
+    price: ModelPricing,
 }
 
+/// Static pricing table (USD / million tokens).
+///
+/// Scanned top-to-bottom; the first row whose pattern(s) all appear
+/// in the lowercased model name wins.  Keep **more-specific** entries
+/// above broader family catch-alls for the same provider.
+///
+/// # Adding a new model
+///
+/// Insert one row before the catch-all for its provider family:
+/// ```text
+/// PricingEntry { primary: "new-model-v3", secondary: None,
+///     price: ModelPricing { input_per_mtok: 1.0, output_per_mtok: 4.0 } },
+/// ```
+///
+/// Sources: Anthropic docs · Google AI pricing (2026-04).
+static PRICING_TABLE: &[PricingEntry] = &[
+    // ── Claude ─────────────────────────────────────────────────────
+    PricingEntry { primary: "opus-4-6",    secondary: None,               price: ModelPricing { input_per_mtok:  5.00, output_per_mtok: 25.00 } },
+    PricingEntry { primary: "opus-4-5",    secondary: None,               price: ModelPricing { input_per_mtok:  5.00, output_per_mtok: 25.00 } },
+    PricingEntry { primary: "opus",        secondary: None,               price: ModelPricing { input_per_mtok: 15.00, output_per_mtok: 75.00 } },
+    PricingEntry { primary: "haiku-4",     secondary: None,               price: ModelPricing { input_per_mtok:  1.00, output_per_mtok:  5.00 } },
+    PricingEntry { primary: "haiku",       secondary: None,               price: ModelPricing { input_per_mtok:  0.25, output_per_mtok:  1.25 } },
+    PricingEntry { primary: "sonnet",      secondary: None,               price: ModelPricing { input_per_mtok:  3.00, output_per_mtok: 15.00 } },
+    PricingEntry { primary: "claude",      secondary: None,               price: ModelPricing { input_per_mtok:  3.00, output_per_mtok: 15.00 } },
+    // ── Gemini ─────────────────────────────────────────────────────
+    PricingEntry { primary: "gemini-3",    secondary: Some("pro"),        price: ModelPricing { input_per_mtok:  2.00, output_per_mtok: 12.00 } },
+    PricingEntry { primary: "gemini-3",    secondary: Some("flash-lite"), price: ModelPricing { input_per_mtok:  0.25, output_per_mtok:  1.50 } },
+    PricingEntry { primary: "gemini-3",    secondary: Some("flash"),      price: ModelPricing { input_per_mtok:  0.50, output_per_mtok:  3.00 } },
+    PricingEntry { primary: "gemini-2.5",  secondary: Some("flash-lite"), price: ModelPricing { input_per_mtok:  0.10, output_per_mtok:  0.40 } },
+    PricingEntry { primary: "gemini-2.5",  secondary: Some("flash"),      price: ModelPricing { input_per_mtok:  0.30, output_per_mtok:  2.50 } },
+    PricingEntry { primary: "gemini-2.5",  secondary: None,               price: ModelPricing { input_per_mtok:  1.25, output_per_mtok: 10.00 } },
+    PricingEntry { primary: "gemini",      secondary: Some("flash"),      price: ModelPricing { input_per_mtok:  0.10, output_per_mtok:  0.40 } },
+    PricingEntry { primary: "gemini",      secondary: None,               price: ModelPricing { input_per_mtok:  1.25, output_per_mtok: 10.00 } },
+    // ── OpenAI ─────────────────────────────────────────────────────
+    PricingEntry { primary: "gpt-4o-mini", secondary: None,               price: ModelPricing { input_per_mtok:  0.15, output_per_mtok:  0.60 } },
+    PricingEntry { primary: "gpt-4o",      secondary: None,               price: ModelPricing { input_per_mtok:  2.50, output_per_mtok: 10.00 } },
+    PricingEntry { primary: "gpt-4",       secondary: None,               price: ModelPricing { input_per_mtok:  2.50, output_per_mtok: 10.00 } },
+    PricingEntry { primary: "gpt-3.5",     secondary: None,               price: ModelPricing { input_per_mtok:  0.50, output_per_mtok:  1.50 } },
+];
+
+/// Looks up the price for `model` by scanning [`PRICING_TABLE`].
+///
+/// Falls back to Sonnet-tier ($3 / $15) for unrecognised models.
+fn get_model_pricing(model: &str) -> ModelPricing {
+    let m = model.to_lowercase();
+    PRICING_TABLE
+        .iter()
+        .find(|e| m.contains(e.primary) && e.secondary.map_or(true, |s| m.contains(s)))
+        .map_or(ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }, |e| e.price)
+}
+
+/// Calculates the USD cost for a single API call.
 fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
-    let pricing = get_model_pricing(model);
-    (input_tokens as f64 / 1_000_000.0) * pricing.input_per_mtok
-        + (output_tokens as f64 / 1_000_000.0) * pricing.output_per_mtok
+    let p = get_model_pricing(model);
+    (input_tokens as f64 / 1_000_000.0) * p.input_per_mtok
+        + (output_tokens as f64 / 1_000_000.0) * p.output_per_mtok
 }

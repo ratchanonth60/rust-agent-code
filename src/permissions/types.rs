@@ -1,3 +1,5 @@
+//! Permission type definitions.
+
 use clap::ValueEnum;
 
 /// Permission modes controlling how tool execution is authorized.
@@ -47,6 +49,7 @@ pub struct PermissionRule {
     pub behavior: RuleBehavior,
 }
 
+/// Behaviour associated with a [`PermissionRule`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleBehavior {
     Allow,

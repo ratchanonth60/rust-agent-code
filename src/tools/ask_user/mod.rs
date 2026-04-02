@@ -1,3 +1,5 @@
+//! Interactive question tool — prompts the user via the TUI.
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -9,11 +11,18 @@ pub type QuestionSender = mpsc::Sender<QuestionRequest>;
 
 /// A question request sent from the tool to the TUI.
 pub struct QuestionRequest {
+    /// The question text to display.
     pub question: String,
+    /// Optional multiple-choice options.
     pub options: Vec<String>,
+    /// Oneshot channel for the user's answer.
     pub response_tx: oneshot::Sender<String>,
 }
 
+/// Sends a question to the user and awaits their typed response.
+///
+/// Requires a TUI channel (set via [`AskUserQuestionTool::new`]).
+/// Without one, the tool returns an error.
 pub struct AskUserQuestionTool {
     pub question_tx: Option<QuestionSender>,
 }

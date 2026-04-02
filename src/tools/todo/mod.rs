@@ -1,3 +1,9 @@
+//! Task tracking tool with shared state.
+//!
+//! The LLM sends a full replacement array of [`TodoItem`]s via
+//! [`TodoWriteTool`].  The shared list is accessible from the TUI
+//! for rendering a progress sidebar.
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +28,7 @@ pub fn new_shared_todo_list() -> SharedTodoList {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// Replaces the entire todo list with the LLM-provided array.
 pub struct TodoWriteTool {
     pub todos: SharedTodoList,
 }

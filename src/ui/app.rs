@@ -1,3 +1,9 @@
+//! TUI application loop — Claude Code-style terminal interface.
+//!
+//! Three-zone layout: scrollable conversation, status line, and input prompt.
+//! Uses typed [`MessageEntry`] variants to render user, assistant, tool, and
+//! permission messages with the correct visual style.
+
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     backend::Backend,
@@ -81,6 +87,7 @@ pub struct App {
 
 struct PendingPermission {
     tool_name: String,
+    #[allow(dead_code)]
     description: String,
     response_tx: oneshot::Sender<PermissionResponse>,
 }

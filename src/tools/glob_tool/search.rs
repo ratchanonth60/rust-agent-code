@@ -1,3 +1,5 @@
+//! [`GlobTool`] — finds files by glob pattern, sorted newest-first.
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -70,15 +72,11 @@ impl Tool for GlobTool {
 
         match glob::glob(&full_pattern) {
             Ok(paths) => {
-                for entry in paths {
-                    if let Ok(path) = entry {
-                        if path.is_file() {
-                            files.push(path);
-                            if files.len() >= MAX_RESULTS {
-                                truncated = true;
-                                break;
-                            }
-                        }
+                for path in paths.flatten().filter(|p| p.is_file()) {
+                    files.push(path);
+                    if files.len() >= MAX_RESULTS {
+                        truncated = true;
+                        break;
                     }
                 }
             }

@@ -1,3 +1,5 @@
+//! File-system tools: read and write.
+
 pub mod read_file;
 pub mod write_file;
 

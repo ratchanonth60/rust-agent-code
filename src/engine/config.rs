@@ -1,3 +1,8 @@
+//! Engine-wide runtime configuration.
+//!
+//! [`EngineConfig`] captures all CLI flags and environment settings
+//! that influence the query loop, permission checks, and cost limits.
+
 use crate::permissions::PermissionMode;
 
 /// Engine configuration derived from CLI arguments and environment.

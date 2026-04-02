@@ -1,4 +1,13 @@
+//! Session-wide API cost and token tracking.
+//!
+//! [`CostTracker`] accumulates per-model token counts and USD costs
+//! across every API call in a session.  It is typically wrapped in an
+//! `Arc<Mutex<CostTracker>>` and shared between the query engine and
+//! the TUI `/cost` command.
+
 use std::collections::HashMap;
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// Per-model token and cost breakdown.
@@ -80,16 +89,17 @@ impl CostTracker {
         }
 
         for (model, usage) in &self.model_usage {
-            let usage_str = format!(
+            use fmt::Write;
+            let _ = write!(
+                result,
                 "{:>21}:  {} input, {} output, {} cache read, {} cache write (${:.4})\n",
                 model,
                 usage.input_tokens,
                 usage.output_tokens,
                 usage.cache_read_input_tokens,
                 usage.cache_creation_input_tokens,
-                usage.cost_usd
+                usage.cost_usd,
             );
-            result.push_str(&usage_str);
         }
 
         result
