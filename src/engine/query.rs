@@ -367,7 +367,7 @@ impl QueryEngine {
 
             let api_start = Instant::now();
             let response = self.http_client
-                .post(url)
+                .post(&url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
                 .json(&request_body)
