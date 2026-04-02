@@ -1,3 +1,5 @@
+//! Exact string-replacement file editing tool.
+
 pub mod edit_file;
 
 pub use edit_file::FileEditTool;

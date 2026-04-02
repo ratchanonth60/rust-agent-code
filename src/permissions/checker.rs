@@ -1,3 +1,9 @@
+//! Core permission check logic.
+//!
+//! [`check_permission`] is the single entry point called before every
+//! tool execution.  It evaluates mode, rules, path safety, and
+//! produces a [`PermissionDecision`].
+
 use std::path::Path;
 
 use crate::permissions::path_safety::{is_dangerous_path, is_within_directory};

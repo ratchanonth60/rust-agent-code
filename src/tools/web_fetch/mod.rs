@@ -1,8 +1,14 @@
+//! URL content fetcher with basic HTML-to-text conversion.
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::tools::{Tool, ToolContext, ToolResult};
 
+/// Fetches a URL and returns the body as plain text.
+///
+/// HTML responses are stripped of tags, `<script>`, and `<style>`
+/// blocks.  Responses longer than 50 000 characters are truncated.
 pub struct WebFetchTool;
 
 #[async_trait]

@@ -1,3 +1,7 @@
+//! Path safety guards — prevents auto-approval of writes to
+//! sensitive files (`.env`, `.ssh/*`, `.git/*`, etc.) and verifies
+//! that file paths stay within the working directory.
+
 use std::path::Path;
 
 /// Files that should never be auto-approved for writing.

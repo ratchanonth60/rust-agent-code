@@ -1,3 +1,5 @@
+//! Loads `CLAUDE.md` instruction files from global and project locations.
+
 use std::path::Path;
 
 /// Load CLAUDE.md files from standard locations, returning concatenated content.

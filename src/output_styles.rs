@@ -1,3 +1,10 @@
+//! User-defined output style loading from Markdown files.
+//!
+//! Scans `~/.rust-agent/output-styles/*.md` (global) and
+//! `./.rust-agent/output-styles/*.md` (project-local) for Markdown
+//! files whose body (after YAML frontmatter) is injected into the
+//! system prompt.
+
 use glob::glob;
 use regex::Regex;
 use std::fs;

@@ -1,20 +1,24 @@
-/// mem System Module
-/// 
-/// This module handles the generation of the System Prompts needed to instruct the LLM
-/// on how to manage its memory. The LLM persistence operates via a virtual RAG over the
-/// file system, indexing into `MEMORY.md`.
+//! Agent memory system — file-based persistence and RAG prompts.
+//!
+//! The LLM is instructed to maintain a `MEMORY.md` index file and
+//! individual topic files under `~/.rust-agent/memory/`.  This module
+//! builds the system-prompt section that teaches the LLM how to use
+//! this memory layer.
 
 use std::path::PathBuf;
 
-/// Get the path to the current agent's local memory directory
+/// Returns the path to the agent's local memory directory (`~/.rust-agent/memory/`).
 pub fn get_auto_mem_path() -> PathBuf {
     // Determine the base user directory (e.g. ~/.rust-agent)
     let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home_dir.join(".rust-agent").join("memory")
 }
 
-/// Builds the system prompt string that injects rules about managing memory logs.
-/// This matches the instruction pipeline from the original TS `buildMemoryLines()`.
+/// Builds the system-prompt section that teaches the LLM how to
+/// manage its persistent memory files.
+///
+/// If `MEMORY.md` exists it is appended verbatim so the LLM has
+/// access to its own prior notes.
 pub fn build_memory_prompt() -> String {
     let memory_dir = get_auto_mem_path();
     let dir_str = memory_dir.to_string_lossy();

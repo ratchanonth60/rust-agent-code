@@ -1,3 +1,6 @@
+//! [`GrepTool`] — content search via ripgrep with regex, file-type
+//! filters, and multiple output modes.
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
