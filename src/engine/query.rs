@@ -96,12 +96,16 @@ impl QueryEngine {
                 });
 
                 if resolved_api_key.is_empty() {
-                    let env_var = match provider {
+                    let env_var_desc = match provider {
                         ModelProvider::OpenAI => "OPENAI_API_KEY",
-                        ModelProvider::OpenAICompatible => "OPENAI_COMPAT_API_KEY",
+                        ModelProvider::OpenAICompatible => "OPENAI_COMPAT_API_KEY, OPENAI_API_KEY, or LLM_API_KEY",
                         _ => unreachable!(),
                     };
-                    return Err(anyhow!("{} is required for {:?} provider", env_var, provider));
+                    return Err(anyhow!(
+                        "Environment variable(s) {} required for {:?} provider",
+                        env_var_desc,
+                        provider
+                    ));
                 }
 
                 config = config.with_api_key(resolved_api_key);
@@ -329,7 +333,12 @@ impl QueryEngine {
             return Err(anyhow!("GEMINI_API_KEY is required for Gemini provider"));
         }
 
-        let url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+        let gemini_base = std::env::var("GEMINI_API_BASE")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        let url = format!(
+            "{}/v1beta/openai/chat/completions",
+            gemini_base.trim_end_matches('/')
+        );
 
         // Build tools in OpenAI function-calling format
         let tools: Vec<Value> = self.tools.iter().map(|t| {
@@ -350,10 +359,10 @@ impl QueryEngine {
 
         loop {
             let request_body = serde_json::json!({
-                "model":      self.model,
+                "model":      &self.model,
                 "max_tokens": self.config.max_tokens,
-                "messages":   messages,
-                "tools":      tools,
+                "messages":   &messages,
+                "tools":      &tools,
             });
 
             let api_start = Instant::now();
@@ -394,7 +403,7 @@ impl QueryEngine {
             let mut asst_msg = serde_json::json!({
                 "role": "assistant",
                 "content": if content.is_empty() { Value::Null } else { Value::String(content.clone()) },
-                "tool_calls": tool_calls,
+                "tool_calls": &tool_calls,
             });
             if let Some(ts) = thought_sig {
                 asst_msg["extra_content"] = serde_json::json!({"google": {"thought_signature": ts}});
@@ -410,7 +419,8 @@ impl QueryEngine {
                 let tc_id     = tc["id"].as_str().unwrap_or("").to_string();
                 let tool_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                 let args_str  = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                let tool_input: Value = serde_json::from_str(args_str).unwrap_or_default();
+                let tool_input: Value = serde_json::from_str(args_str)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
 
                 let result_content = if let Some(tool) = self.find_tool(&tool_name) {
                     if let Some(ref tx) = tx_ui {
