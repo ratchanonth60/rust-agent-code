@@ -1,3 +1,5 @@
+//! [`GlobTool`] — finds files by glob pattern, sorted newest-first.
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;

@@ -1,3 +1,9 @@
+//! Tool system: trait definition, context, result types, and sub-module registry.
+//!
+//! Every agent tool implements the [`Tool`] trait.  The engine stores tools as
+//! `Vec<Box<dyn Tool + Send + Sync>>` and dispatches calls by matching the
+//! LLM's `function.name` against [`Tool::name`].
+
 pub mod bash;
 pub mod edit;
 pub mod fs;

@@ -1,3 +1,5 @@
+//! Domain models — task lifecycle, conversation messages, and attachments.
+
 use serde::{Deserialize, Serialize};
 
 /// The environment or execution mode an agent task operates within.

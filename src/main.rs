@@ -1,3 +1,11 @@
+//! Rust Agent — a Rust port of Claude Code.
+//!
+//! Entry point for the CLI.  Supports three operating modes:
+//! - **One-shot** (`--query "..."`) — run a single query and exit.
+//! - **Bare** (`--bare`) — simple stdin/stdout REPL without TUI.
+//! - **Interactive** (default) — full ratatui TUI with streaming,
+//!   tool dots, permission prompts, and slash commands.
+
 pub mod engine;
 pub mod models;
 pub mod tools;
@@ -61,6 +69,7 @@ struct Args {
     permission_mode: PermissionMode,
 }
 
+/// Returns the default model name for a given provider.
 fn default_model(provider: ModelProvider) -> &'static str {
     match provider {
         ModelProvider::Gemini => "gemini-2.5-pro",
@@ -203,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Prints the session cost summary to stderr (if any cost was incurred).
 fn print_cost_summary(cost_tracker: &std::sync::Arc<std::sync::Mutex<crate::engine::cost_tracker::CostTracker>>) {
     if let Ok(tracker) = cost_tracker.lock() {
         if tracker.total_cost_usd > 0.0 {

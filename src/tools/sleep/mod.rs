@@ -1,8 +1,11 @@
+//! Timed pause tool — sleeps for a specified number of seconds.
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::tools::{Tool, ToolContext, ToolResult};
 
+/// Pauses execution for 1–300 seconds.
 pub struct SleepTool;
 
 #[async_trait]

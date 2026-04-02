@@ -1,3 +1,5 @@
+//! [`FileEditTool`] — performs exact string replacements in files.
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;

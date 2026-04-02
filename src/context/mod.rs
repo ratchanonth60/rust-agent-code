@@ -1,8 +1,13 @@
+//! Context injection — CLAUDE.md files, git status, and system info.
+//!
+//! [`build_context_prompt`] assembles the full block that is prepended
+//! to the system prompt before every LLM call.
+
 pub mod claudemd;
 pub mod git;
 pub mod system_info;
 
-/// Build the full context block that gets injected into the system prompt.
+/// Builds the full context block that gets injected into the system prompt.
 pub fn build_context_prompt(cwd: &std::path::Path) -> String {
     let mut parts = Vec::new();
 
