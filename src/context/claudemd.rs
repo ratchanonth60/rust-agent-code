@@ -13,29 +13,20 @@ pub fn load_claudemd_files(cwd: &Path) -> String {
 
     // Global CLAUDE.md
     if let Some(home) = dirs::home_dir() {
-        let global = home.join(".claude").join("CLAUDE.md");
-        if let Ok(content) = std::fs::read_to_string(&global) {
-            if !content.trim().is_empty() {
-                parts.push(format!("## Global (~/.claude/CLAUDE.md)\n\n{}", content.trim()));
-            }
-        }
+        try_load_section(&home.join(".claude").join("CLAUDE.md"), "Global (~/.claude/CLAUDE.md)", &mut parts);
     }
 
-    // Project root CLAUDE.md
-    let project_root = cwd.join("CLAUDE.md");
-    if let Ok(content) = std::fs::read_to_string(&project_root) {
-        if !content.trim().is_empty() {
-            parts.push(format!("## Project (CLAUDE.md)\n\n{}", content.trim()));
-        }
-    }
-
-    // Project .claude/CLAUDE.md
-    let project_claude_dir = cwd.join(".claude").join("CLAUDE.md");
-    if let Ok(content) = std::fs::read_to_string(&project_claude_dir) {
-        if !content.trim().is_empty() {
-            parts.push(format!("## Project (.claude/CLAUDE.md)\n\n{}", content.trim()));
-        }
-    }
+    try_load_section(&cwd.join("CLAUDE.md"),                   "Project (CLAUDE.md)",        &mut parts);
+    try_load_section(&cwd.join(".claude").join("CLAUDE.md"),   "Project (.claude/CLAUDE.md)", &mut parts);
 
     parts.join("\n\n")
+}
+
+/// Reads `path`; if non-empty, pushes a `## <label>\n\n<content>` section.
+fn try_load_section(path: &Path, label: &str, parts: &mut Vec<String>) {
+    let Ok(content) = std::fs::read_to_string(path) else { return };
+    let content = content.trim();
+    if !content.is_empty() {
+        parts.push(format!("## {label}\n\n{content}"));
+    }
 }

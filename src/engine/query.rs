@@ -644,48 +644,8 @@ impl QueryEngine {
                 let mut tool_result_blocks = Vec::new();
                 for tu in &streamed.tool_uses {
                     let tool_input = parse_tool_input(&tu.input_json);
-                    if let Some(tool) = self.find_tool(&tu.name) {
-                        // Permission check
-                        let allowed = self.check_tool_permission(tool, &tool_input, &tx_ui).await?;
-                        if !allowed {
-                            tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                tool_use_id: tu.id.clone(),
-                                content: format!("Permission denied for tool '{}'.", tu.name),
-                                is_error: Some(true),
-                            });
-                            continue;
-                        }
-
-                        let exec_result = tool.call(tool_input, ctx).await;
-
-                        if let Some(ref tx) = tx_ui {
-                            let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(tu.name.clone())).await;
-                        }
-
-                        match exec_result {
-                            Ok(res) => {
-                                tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                    tool_use_id: tu.id.clone(),
-                                    content: serde_json::to_string(&res.output)
-                                        .unwrap_or_else(|_| "{}".to_string()),
-                                    is_error: if res.is_error { Some(true) } else { None },
-                                });
-                            }
-                            Err(e) => {
-                                tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                    tool_use_id: tu.id.clone(),
-                                    content: format!("Error executing tool: {}", e),
-                                    is_error: Some(true),
-                                });
-                            }
-                        }
-                    } else {
-                        tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                            tool_use_id: tu.id.clone(),
-                            content: format!("Error: Tool '{}' not found.", tu.name),
-                            is_error: Some(true),
-                        });
-                    }
+                    let block = self.execute_claude_tool(&tu.id, &tu.name, tool_input, ctx, &tx_ui).await?;
+                    tool_result_blocks.push(block);
                 }
 
                 messages.push(ClaudeMessage {
@@ -715,43 +675,8 @@ impl QueryEngine {
                 let mut tool_result_blocks = Vec::new();
                 for block in &api_response.content {
                     if let ClaudeContentBlock::ToolUse { id, name, input } = block {
-                        if let Some(tool) = self.find_tool(name) {
-                            // Permission check
-                            let allowed = self.check_tool_permission(tool, input, &tx_ui).await?;
-                            if !allowed {
-                                tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: format!("Permission denied for tool '{}'.", name),
-                                    is_error: Some(true),
-                                });
-                                continue;
-                            }
-
-                            let exec_result = tool.call(input.clone(), ctx).await;
-                            match exec_result {
-                                Ok(res) => {
-                                    tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: serde_json::to_string(&res.output)
-                                            .unwrap_or_else(|_| "{}".to_string()),
-                                        is_error: if res.is_error { Some(true) } else { None },
-                                    });
-                                }
-                                Err(e) => {
-                                    tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                        tool_use_id: id.clone(),
-                                        content: format!("Error executing tool: {}", e),
-                                        is_error: Some(true),
-                                    });
-                                }
-                            }
-                        } else {
-                            tool_result_blocks.push(ClaudeContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: format!("Error: Tool '{}' not found.", name),
-                                is_error: Some(true),
-                            });
-                        }
+                        let result = self.execute_claude_tool(id, name, input.clone(), ctx, &tx_ui).await?;
+                        tool_result_blocks.push(result);
                     }
                 }
 
@@ -773,6 +698,54 @@ impl QueryEngine {
                     content: tool_result_blocks,
                 });
             }
+        }
+    }
+
+    /// Executes a single Claude tool call and returns a [`ClaudeContentBlock::ToolResult`].
+    ///
+    /// Shared by both the streaming and non-streaming Claude paths.
+    /// Handles permission checks, TUI notifications, and error wrapping.
+    async fn execute_claude_tool(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        tool_input: Value,
+        ctx: &ToolContext,
+        tx_ui: &Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+    ) -> Result<ClaudeContentBlock> {
+        let Some(tool) = self.find_tool(tool_name) else {
+            return Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Error: Tool '{}' not found.", tool_name),
+                is_error: Some(true),
+            });
+        };
+
+        let allowed = self.check_tool_permission(tool, &tool_input, tx_ui).await?;
+        if !allowed {
+            return Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Permission denied for tool '{}'.", tool_name),
+                is_error: Some(true),
+            });
+        }
+
+        let exec_result = tool.call(tool_input, ctx).await;
+        if let Some(ref tx) = tx_ui {
+            let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(tool_name.to_string())).await;
+        }
+
+        match exec_result {
+            Ok(res) => Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: serde_json::to_string(&res.output).unwrap_or_else(|_| "{}".to_string()),
+                is_error: if res.is_error { Some(true) } else { None },
+            }),
+            Err(e) => Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Error executing tool: {}", e),
+                is_error: Some(true),
+            }),
         }
     }
 }
@@ -865,41 +838,75 @@ struct ClaudeUsage {
 // ── Cost calculation ───────────────────────────────────────────────
 
 /// Per-model pricing in USD per million tokens.
+#[derive(Clone, Copy)]
 struct ModelPricing {
     input_per_mtok: f64,
     output_per_mtok: f64,
 }
 
-/// Returns pricing for known model families.
+/// A row in the static pricing lookup table.
+struct PricingEntry {
+    /// Required substring (lowercased) in the model name.
+    primary: &'static str,
+    /// Optional second substring; both must match when set.
+    secondary: Option<&'static str>,
+    price: ModelPricing,
+}
+
+/// Static pricing table (USD / million tokens).
 ///
-/// Falls back to Claude Sonnet-tier pricing for unrecognised models.
+/// Scanned top-to-bottom; the first row whose pattern(s) all appear
+/// in the lowercased model name wins.  Keep **more-specific** entries
+/// above broader family catch-alls for the same provider.
+///
+/// # Adding a new model
+///
+/// Insert one row before the catch-all for its provider family:
+/// ```text
+/// PricingEntry { primary: "new-model-v3", secondary: None,
+///     price: ModelPricing { input_per_mtok: 1.0, output_per_mtok: 4.0 } },
+/// ```
+///
+/// Sources: Anthropic docs · Google AI pricing (2026-04).
+static PRICING_TABLE: &[PricingEntry] = &[
+    // ── Claude ─────────────────────────────────────────────────────
+    PricingEntry { primary: "opus-4-6",    secondary: None,               price: ModelPricing { input_per_mtok:  5.00, output_per_mtok: 25.00 } },
+    PricingEntry { primary: "opus-4-5",    secondary: None,               price: ModelPricing { input_per_mtok:  5.00, output_per_mtok: 25.00 } },
+    PricingEntry { primary: "opus",        secondary: None,               price: ModelPricing { input_per_mtok: 15.00, output_per_mtok: 75.00 } },
+    PricingEntry { primary: "haiku-4",     secondary: None,               price: ModelPricing { input_per_mtok:  1.00, output_per_mtok:  5.00 } },
+    PricingEntry { primary: "haiku",       secondary: None,               price: ModelPricing { input_per_mtok:  0.25, output_per_mtok:  1.25 } },
+    PricingEntry { primary: "sonnet",      secondary: None,               price: ModelPricing { input_per_mtok:  3.00, output_per_mtok: 15.00 } },
+    PricingEntry { primary: "claude",      secondary: None,               price: ModelPricing { input_per_mtok:  3.00, output_per_mtok: 15.00 } },
+    // ── Gemini ─────────────────────────────────────────────────────
+    PricingEntry { primary: "gemini-3",    secondary: Some("pro"),        price: ModelPricing { input_per_mtok:  2.00, output_per_mtok: 12.00 } },
+    PricingEntry { primary: "gemini-3",    secondary: Some("flash-lite"), price: ModelPricing { input_per_mtok:  0.25, output_per_mtok:  1.50 } },
+    PricingEntry { primary: "gemini-3",    secondary: Some("flash"),      price: ModelPricing { input_per_mtok:  0.50, output_per_mtok:  3.00 } },
+    PricingEntry { primary: "gemini-2.5",  secondary: Some("flash-lite"), price: ModelPricing { input_per_mtok:  0.10, output_per_mtok:  0.40 } },
+    PricingEntry { primary: "gemini-2.5",  secondary: Some("flash"),      price: ModelPricing { input_per_mtok:  0.30, output_per_mtok:  2.50 } },
+    PricingEntry { primary: "gemini-2.5",  secondary: None,               price: ModelPricing { input_per_mtok:  1.25, output_per_mtok: 10.00 } },
+    PricingEntry { primary: "gemini",      secondary: Some("flash"),      price: ModelPricing { input_per_mtok:  0.10, output_per_mtok:  0.40 } },
+    PricingEntry { primary: "gemini",      secondary: None,               price: ModelPricing { input_per_mtok:  1.25, output_per_mtok: 10.00 } },
+    // ── OpenAI ─────────────────────────────────────────────────────
+    PricingEntry { primary: "gpt-4o-mini", secondary: None,               price: ModelPricing { input_per_mtok:  0.15, output_per_mtok:  0.60 } },
+    PricingEntry { primary: "gpt-4o",      secondary: None,               price: ModelPricing { input_per_mtok:  2.50, output_per_mtok: 10.00 } },
+    PricingEntry { primary: "gpt-4",       secondary: None,               price: ModelPricing { input_per_mtok:  2.50, output_per_mtok: 10.00 } },
+    PricingEntry { primary: "gpt-3.5",     secondary: None,               price: ModelPricing { input_per_mtok:  0.50, output_per_mtok:  1.50 } },
+];
+
+/// Looks up the price for `model` by scanning [`PRICING_TABLE`].
+///
+/// Falls back to Sonnet-tier ($3 / $15) for unrecognised models.
 fn get_model_pricing(model: &str) -> ModelPricing {
     let m = model.to_lowercase();
-    if m.contains("opus") {
-        // Claude Opus 4/4.1: $15/$75
-        ModelPricing { input_per_mtok: 15.0, output_per_mtok: 75.0 }
-    } else if m.contains("haiku") {
-        // Claude Haiku: $1/$5
-        ModelPricing { input_per_mtok: 1.0, output_per_mtok: 5.0 }
-    } else if m.contains("sonnet") || m.contains("claude") {
-        // Claude Sonnet: $3/$15
-        ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }
-    } else if m.contains("gpt-4o-mini") {
-        ModelPricing { input_per_mtok: 0.15, output_per_mtok: 0.60 }
-    } else if m.contains("gpt-4o") || m.contains("gpt-4") {
-        ModelPricing { input_per_mtok: 2.50, output_per_mtok: 10.0 }
-    } else if m.contains("gemini") {
-        // Gemini 2.5 Pro: free tier / $1.25/$10 for paid
-        ModelPricing { input_per_mtok: 1.25, output_per_mtok: 10.0 }
-    } else {
-        // Default: moderate pricing
-        ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }
-    }
+    PRICING_TABLE
+        .iter()
+        .find(|e| m.contains(e.primary) && e.secondary.map_or(true, |s| m.contains(s)))
+        .map_or(ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }, |e| e.price)
 }
 
 /// Calculates the USD cost for a single API call.
 fn calculate_cost(model: &str, input_tokens: u64, output_tokens: u64) -> f64 {
-    let pricing = get_model_pricing(model);
-    (input_tokens as f64 / 1_000_000.0) * pricing.input_per_mtok
-        + (output_tokens as f64 / 1_000_000.0) * pricing.output_per_mtok
+    let p = get_model_pricing(model);
+    (input_tokens as f64 / 1_000_000.0) * p.input_per_mtok
+        + (output_tokens as f64 / 1_000_000.0) * p.output_per_mtok
 }

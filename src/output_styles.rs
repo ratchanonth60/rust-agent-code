@@ -7,6 +7,7 @@
 
 use glob::glob;
 use regex::Regex;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use tracing::warn;
 
@@ -76,7 +77,7 @@ pub fn build_styles_prompt() -> String {
     
     let mut prompt = String::from("\n# Output Styles\nPlease adhere to the following output styles when generating your response:\n\n");
     for style in styles {
-        prompt.push_str(&format!("## Style: {}\n{}\n\n", style.name, style.prompt.trim()));
+        let _ = write!(prompt, "## Style: {}\n{}\n\n", style.name, style.prompt.trim());
     }
     
     prompt

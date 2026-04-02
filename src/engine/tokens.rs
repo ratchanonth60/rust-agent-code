@@ -33,9 +33,17 @@ pub fn estimate_conversation_tokens(messages: &[serde_json::Value]) -> u64 {
 ///
 /// Uses substring matching on the lowercased model identifier.
 /// Falls back to 128 000 tokens for unrecognised models.
+///
+/// Sources:
+/// - Anthropic docs (2026-04): Opus 4.6, Sonnet 4.6 = 1M; others = 200k
+/// - Google AI pricing (2026-04): Gemini 2.5+ = 1M
+/// - OpenAI: GPT-4o = 128k
 pub fn get_context_window(model: &str) -> u64 {
     let m = model.to_lowercase();
-    if m.contains("claude") {
+    // Claude Opus 4.6 and Sonnet 4.6 have a 1M context window.
+    if m.contains("opus-4-6") || m.contains("sonnet-4-6") {
+        1_000_000
+    } else if m.contains("claude") {
         200_000
     } else if m.contains("gpt-4o") || m.contains("gpt-4") {
         128_000
@@ -76,6 +84,8 @@ mod tests {
 
     #[test]
     fn context_windows() {
+        assert_eq!(get_context_window("claude-opus-4-6"), 1_000_000);
+        assert_eq!(get_context_window("claude-sonnet-4-6"), 1_000_000);
         assert_eq!(get_context_window("claude-sonnet-4-20250514"), 200_000);
         assert_eq!(get_context_window("gpt-4o"), 128_000);
         assert_eq!(get_context_window("gemini-2.5-pro"), 1_000_000);
