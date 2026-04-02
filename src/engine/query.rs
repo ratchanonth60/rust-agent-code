@@ -398,7 +398,7 @@ impl QueryEngine {
             let mut asst_msg = serde_json::json!({
                 "role": "assistant",
                 "content": if content.is_empty() { Value::Null } else { Value::String(content.clone()) },
-                "tool_calls": tool_calls,
+                "tool_calls": &tool_calls,
             });
             if let Some(ts) = thought_sig {
                 asst_msg["extra_content"] = serde_json::json!({"google": {"thought_signature": ts}});
