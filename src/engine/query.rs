@@ -328,7 +328,12 @@ impl QueryEngine {
             return Err(anyhow!("GEMINI_API_KEY is required for Gemini provider"));
         }
 
-        let url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+        let gemini_base = std::env::var("GEMINI_API_BASE")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        let url = format!(
+            "{}/v1beta/openai/chat/completions",
+            gemini_base.trim_end_matches('/')
+        );
 
         // Build tools in OpenAI function-calling format
         let tools: Vec<Value> = self.tools.iter().map(|t| {
