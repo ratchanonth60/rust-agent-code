@@ -349,10 +349,10 @@ impl QueryEngine {
 
         loop {
             let request_body = serde_json::json!({
-                "model":      self.model,
+                "model":      &self.model,
                 "max_tokens": self.config.max_tokens,
-                "messages":   messages,
-                "tools":      tools,
+                "messages":   &messages,
+                "tools":      &tools,
             });
 
             let api_start = Instant::now();
