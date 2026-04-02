@@ -414,7 +414,8 @@ impl QueryEngine {
                 let tc_id     = tc["id"].as_str().unwrap_or("").to_string();
                 let tool_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                 let args_str  = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                let tool_input: Value = serde_json::from_str(args_str).unwrap_or_default();
+                let tool_input: Value = serde_json::from_str(args_str)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
 
                 let result_content = if let Some(tool) = self.find_tool(&tool_name) {
                     if let Some(ref tx) = tx_ui {
