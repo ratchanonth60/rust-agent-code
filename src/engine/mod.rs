@@ -3,6 +3,7 @@
 //! Aggregates the query engine, configuration, cost tracking, streaming,
 //! token estimation, and context compaction sub-modules.
 
+pub mod agent_tool;
 pub mod compaction;
 pub mod config;
 pub mod cost_tracker;

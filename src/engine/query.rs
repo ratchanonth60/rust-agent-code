@@ -10,6 +10,7 @@
 //! - **OpenAI / Gemini / OpenAI-compatible** — via [`async_openai`]
 
 use anyhow::{anyhow, Context, Result};
+use futures_util::future::join_all;
 use async_openai::{
     config::OpenAIConfig,
     types::{
@@ -78,35 +79,43 @@ impl QueryEngine {
         config: EngineConfig,
     ) -> Result<Self> {
         let openai_client = match provider {
-            ModelProvider::Claude => None,
+            // Claude and Gemini have their own HTTP paths; no async_openai client needed.
+            ModelProvider::Claude | ModelProvider::Gemini => None,
             _ => {
                 let mut config = OpenAIConfig::default();
 
                 let resolved_api_key = api_key.unwrap_or_else(|| match provider {
                     ModelProvider::OpenAI => std::env::var("OPENAI_API_KEY").unwrap_or_default(),
-                    ModelProvider::Gemini => std::env::var("GEMINI_API_KEY").unwrap_or_default(),
                     ModelProvider::OpenAICompatible => {
                         std::env::var("OPENAI_COMPAT_API_KEY")
                             .or_else(|_| std::env::var("OPENAI_API_KEY"))
                             .or_else(|_| std::env::var("LLM_API_KEY"))
                             .unwrap_or_default()
                     }
-                    ModelProvider::Claude => String::new(),
+                    _ => String::new(),
                 });
+
+                if resolved_api_key.is_empty() {
+                    let env_var_desc = match provider {
+                        ModelProvider::OpenAI => "OPENAI_API_KEY",
+                        ModelProvider::OpenAICompatible => "OPENAI_COMPAT_API_KEY, OPENAI_API_KEY, or LLM_API_KEY",
+                        _ => unreachable!(),
+                    };
+                    return Err(anyhow!(
+                        "Environment variable(s) {} required for {:?} provider",
+                        env_var_desc,
+                        provider
+                    ));
+                }
 
                 config = config.with_api_key(resolved_api_key);
 
                 let resolved_api_base = match provider {
                     ModelProvider::OpenAI => api_base,
-                    ModelProvider::Gemini => Some(
-                        api_base.unwrap_or_else(|| {
-                            "https://generativelanguage.googleapis.com/v1beta/openai/".to_string()
-                        }),
-                    ),
                     ModelProvider::OpenAICompatible => api_base
                         .or_else(|| std::env::var("OPENAI_COMPAT_API_BASE").ok())
                         .or_else(|| std::env::var("OPENAI_API_BASE").ok()),
-                    ModelProvider::Claude => None,
+                    _ => None,
                 };
 
                 if let Some(base) = resolved_api_base {
@@ -144,6 +153,26 @@ impl QueryEngine {
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             todo_list,
         })
+    }
+
+    /// Register an [`AgentTool`] that can spawn sub-agents with this engine's
+    /// model and configuration.  Sub-agents do **not** inherit the AgentTool,
+    /// preventing infinite recursion.
+    ///
+    /// Follows a builder pattern so it can be chained after [`QueryEngine::new`]:
+    ///
+    /// ```ignore
+    /// let engine = QueryEngine::new(model, provider, None, None, config)?
+    ///     .with_agent_tool();
+    /// ```
+    pub fn with_agent_tool(mut self) -> Self {
+        use crate::engine::agent_tool::AgentTool;
+        self.tools.push(Box::new(AgentTool::new(
+            self.model.clone(),
+            self.provider,
+            self.config.clone(),
+        )));
+        self
     }
 
     /// Converts registered tools into the OpenAI function-calling schema.
@@ -294,11 +323,172 @@ impl QueryEngine {
 
         match self.provider {
             ModelProvider::Claude => self.query_claude(input, &system_prompt, &ctx, tx_ui, context_window).await,
+            ModelProvider::Gemini => self.query_gemini(input, &system_prompt, &ctx, tx_ui).await,
             _ => self.query_openai_compatible(input, &system_prompt, &ctx, tx_ui, context_window).await,
         }
     }
 
-    /// OpenAI-compatible agentic loop (OpenAI, Gemini, and compatible providers).
+    /// Resolves the Gemini API key from environment variables.
+    fn get_gemini_key(&self) -> String {
+        std::env::var("GEMINI_API_KEY")
+            .or_else(|_| std::env::var("LLM_API_KEY"))
+            .unwrap_or_default()
+    }
+
+    /// Gemini-native agentic loop using direct HTTP (not async_openai).
+    ///
+    /// Gemini's thinking models include a `thought_signature` in tool-use
+    /// responses that must be echoed back in the following assistant message.
+    /// `async_openai` has no awareness of this field, so we manage the
+    /// conversation as raw JSON via our `http_client`.
+    async fn query_gemini(
+        &self,
+        input: &str,
+        system_prompt: &str,
+        ctx: &ToolContext,
+        tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+    ) -> Result<String> {
+        let api_key = self.get_gemini_key();
+        if api_key.is_empty() {
+            return Err(anyhow!("GEMINI_API_KEY is required for Gemini provider"));
+        }
+
+        let gemini_base = std::env::var("GEMINI_API_BASE")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        let url = format!(
+            "{}/v1beta/openai/chat/completions",
+            gemini_base.trim_end_matches('/')
+        );
+
+        // Build tools in OpenAI function-calling format
+        let tools: Vec<Value> = self.tools.iter().map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name(),
+                    "description": t.description(),
+                    "parameters": t.input_schema()
+                }
+            })
+        }).collect();
+
+        let mut messages: Vec<Value> = vec![
+            serde_json::json!({"role": "system", "content": system_prompt}),
+            serde_json::json!({"role": "user",   "content": input}),
+        ];
+
+        loop {
+            let request_body = serde_json::json!({
+                "model":      &self.model,
+                "max_tokens": self.config.max_tokens,
+                "messages":   &messages,
+                "tools":      &tools,
+            });
+
+            let api_start = Instant::now();
+            let response = self.http_client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send().await?;
+            let api_duration = api_start.elapsed().as_millis() as u64;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!("Gemini API error {}: {}", status, body));
+            }
+
+            let resp: Value = response.json().await?;
+
+            // Track cost
+            if let Some(usage) = resp.get("usage") {
+                let input_tok  = usage["prompt_tokens"].as_u64().unwrap_or(0);
+                let output_tok = usage["completion_tokens"].as_u64().unwrap_or(0);
+                let cost = calculate_cost(&self.model, input_tok, output_tok);
+                if let Ok(mut tracker) = self.cost_tracker.lock() {
+                    tracker.add_usage(&self.model, input_tok, output_tok, cost);
+                    tracker.total_api_duration_ms += api_duration;
+                }
+            }
+
+            let choices = resp["choices"]
+                .as_array()
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Gemini response missing or empty 'choices' array. Response: {}",
+                        resp
+                    )
+                })?;
+            let msg = choices[0]
+                .get("message")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Gemini response choices[0] missing 'message' field. Response: {}",
+                        resp
+                    )
+                })?;
+            let content     = msg["content"].as_str().unwrap_or("").to_string();
+            let thought_sig = msg["extra_content"]["google"]["thought_signature"]
+                .as_str().map(String::from);
+            let tool_calls  = msg["tool_calls"].as_array().cloned().unwrap_or_default();
+
+            // Build assistant message, preserving thought_signature for thinking models
+            let mut asst_msg = serde_json::json!({
+                "role": "assistant",
+                "content": if content.is_empty() { Value::Null } else { Value::String(content.clone()) },
+                "tool_calls": &tool_calls,
+            });
+            if let Some(ts) = thought_sig {
+                asst_msg["extra_content"] = serde_json::json!({"google": {"thought_signature": ts}});
+            }
+            messages.push(asst_msg);
+
+            if tool_calls.is_empty() {
+                return Ok(content);
+            }
+
+            // Execute all tool calls and collect results
+            for tc in &tool_calls {
+                let tc_id     = tc["id"].as_str().unwrap_or("").to_string();
+                let tool_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                let args_str  = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let tool_input: Value = serde_json::from_str(args_str)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+
+                let result_content = if let Some(tool) = self.find_tool(&tool_name) {
+                    if let Some(ref tx) = tx_ui {
+                        let _ = tx.send(crate::ui::app::UiEvent::ToolStarted(tool_name.clone())).await;
+                    }
+                    let allowed = self.check_tool_permission(tool, &tool_input, &tx_ui).await?;
+                    if !allowed {
+                        format!("Permission denied for tool '{}'.", tool_name)
+                    } else {
+                        let exec = tool.call(tool_input, ctx).await;
+                        if let Some(ref tx) = tx_ui {
+                            let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(tool_name.clone())).await;
+                        }
+                        match exec {
+                            Ok(res) => serde_json::to_string(&res.output).unwrap_or_else(|_| "{}".to_string()),
+                            Err(e)  => format!("Error executing tool: {}", e),
+                        }
+                    }
+                } else {
+                    format!("Error: Tool '{}' not found.", tool_name)
+                };
+
+                messages.push(serde_json::json!({
+                    "role":         "tool",
+                    "tool_call_id": tc_id,
+                    "content":      result_content,
+                }));
+            }
+        }
+    }
+
+    /// OpenAI-compatible agentic loop (OpenAI and compatible providers).
     async fn query_openai_compatible(
         &self,
         input: &str,
@@ -641,12 +831,14 @@ impl QueryEngine {
                     return Ok(streamed.text);
                 }
 
-                let mut tool_result_blocks = Vec::new();
-                for tu in &streamed.tool_uses {
-                    let tool_input = parse_tool_input(&tu.input_json);
-                    let block = self.execute_claude_tool(&tu.id, &tu.name, tool_input, ctx, &tx_ui).await?;
-                    tool_result_blocks.push(block);
-                }
+                let calls: Vec<ToolCall> = streamed.tool_uses.iter()
+                    .map(|tu| ToolCall {
+                        id: tu.id.clone(),
+                        name: tu.name.clone(),
+                        input: parse_tool_input(&tu.input_json),
+                    })
+                    .collect();
+                let tool_result_blocks = self.execute_tools_parallel(&calls, ctx, &tx_ui).await?;
 
                 messages.push(ClaudeMessage {
                     role: "user".to_string(),
@@ -672,13 +864,16 @@ impl QueryEngine {
                     content: api_response.content.clone(),
                 });
 
-                let mut tool_result_blocks = Vec::new();
-                for block in &api_response.content {
-                    if let ClaudeContentBlock::ToolUse { id, name, input } = block {
-                        let result = self.execute_claude_tool(id, name, input.clone(), ctx, &tx_ui).await?;
-                        tool_result_blocks.push(result);
-                    }
-                }
+                let calls: Vec<ToolCall> = api_response.content.iter()
+                    .filter_map(|block| {
+                        if let ClaudeContentBlock::ToolUse { id, name, input } = block {
+                            Some(ToolCall { id: id.clone(), name: name.clone(), input: input.clone() })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let tool_result_blocks = self.execute_tools_parallel(&calls, ctx, &tx_ui).await?;
 
                 if tool_result_blocks.is_empty() {
                     let final_text = api_response
@@ -701,27 +896,42 @@ impl QueryEngine {
         }
     }
 
-    /// Executes a single Claude tool call and returns a [`ClaudeContentBlock::ToolResult`].
-    ///
-    /// Shared by both the streaming and non-streaming Claude paths.
-    /// Handles permission checks, TUI notifications, and error wrapping.
-    async fn execute_claude_tool(
+    /// Execute a batch of tool calls: permission checks run sequentially (one TUI dialog at a
+    /// time), then all approved tools execute concurrently.  Results are returned in the same
+    /// order as `calls`.
+    async fn execute_tools_parallel(
         &self,
+        calls: &[ToolCall],
+        ctx: &ToolContext,
+        tx_ui: &Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+    ) -> Result<Vec<ClaudeContentBlock>> {
+        // Phase 1: sequential permission checks (user prompts must not overlap).
+        let mut permitted = Vec::with_capacity(calls.len());
+        for call in calls {
+            let allowed = match self.find_tool(&call.name) {
+                None => false,
+                Some(tool) => self.check_tool_permission(tool, &call.input, tx_ui).await?,
+            };
+            permitted.push(allowed);
+        }
+
+        // Phase 2: parallel execution — all approved tools run concurrently.
+        let futs = calls.iter().zip(permitted.into_iter()).map(|(call, allowed)| {
+            self.run_tool(allowed, &call.id, &call.name, call.input.clone(), ctx, tx_ui)
+        });
+        join_all(futs).await.into_iter().collect()
+    }
+
+    /// Execute a single tool whose permission has already been resolved.
+    async fn run_tool(
+        &self,
+        allowed: bool,
         tool_use_id: &str,
         tool_name: &str,
         tool_input: Value,
         ctx: &ToolContext,
         tx_ui: &Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
     ) -> Result<ClaudeContentBlock> {
-        let Some(tool) = self.find_tool(tool_name) else {
-            return Ok(ClaudeContentBlock::ToolResult {
-                tool_use_id: tool_use_id.to_string(),
-                content: format!("Error: Tool '{}' not found.", tool_name),
-                is_error: Some(true),
-            });
-        };
-
-        let allowed = self.check_tool_permission(tool, &tool_input, tx_ui).await?;
         if !allowed {
             return Ok(ClaudeContentBlock::ToolResult {
                 tool_use_id: tool_use_id.to_string(),
@@ -729,6 +939,14 @@ impl QueryEngine {
                 is_error: Some(true),
             });
         }
+
+        let Some(tool) = self.find_tool(tool_name) else {
+            return Ok(ClaudeContentBlock::ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Error: Tool '{}' not found.", tool_name),
+                is_error: Some(true),
+            });
+        };
 
         let exec_result = tool.call(tool_input, ctx).await;
         if let Some(ref tx) = tx_ui {
@@ -751,6 +969,13 @@ impl QueryEngine {
 }
 
 // ── Claude API wire types ──────────────────────────────────────────
+
+/// A pending tool invocation extracted from an LLM response.
+struct ToolCall {
+    id: String,
+    name: String,
+    input: Value,
+}
 
 /// Tool definition in the Claude Messages API format.
 #[derive(Debug, Clone, Serialize)]

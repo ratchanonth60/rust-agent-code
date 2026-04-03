@@ -119,7 +119,8 @@ async fn main() -> anyhow::Result<()> {
         args.api_key.clone(),
         args.api_base.clone(),
         config,
-    )?;
+    )?
+    .with_agent_tool();
 
     if let Some(q) = args.query {
         // One-shot mode
