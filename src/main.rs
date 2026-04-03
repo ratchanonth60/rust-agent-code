@@ -6,15 +6,15 @@
 //! - **Interactive** (default) — full ratatui TUI with streaming,
 //!   tool dots, permission prompts, and slash commands.
 
+pub mod context;
 pub mod engine;
-pub mod models;
-pub mod tools;
-pub mod ui;
-pub mod mem;
 pub mod keybindings;
+pub mod mem;
+pub mod models;
 pub mod output_styles;
 pub mod permissions;
-pub mod context;
+pub mod tools;
+pub mod ui;
 
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -72,7 +72,7 @@ struct Args {
 /// Returns the default model name for a given provider.
 fn default_model(provider: ModelProvider) -> &'static str {
     match provider {
-        ModelProvider::Gemini => "gemini-2.5-pro",
+        ModelProvider::Gemini => "gemini-2.5-flash",
         ModelProvider::OpenAI => "gpt-4o-mini",
         ModelProvider::Claude => "claude-sonnet-4-6",
         ModelProvider::OpenAICompatible => "gpt-4o-mini",
@@ -84,12 +84,32 @@ async fn main() -> anyhow::Result<()> {
     // Attempt to load .env file
     let _ = dotenvy::dotenv();
 
-    // Initialize tracing
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Setting default subscriber failed");
+    // In TUI mode ratatui owns the terminal; any write to stdout/stderr corrupts it.
+    // Redirect tracing to a log file instead.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".rust-agent.log"),
+        )
+        .ok();
+    if let Some(file) = log_file {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(Level::INFO)
+            .with_writer(std::sync::Mutex::new(file))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("Setting default subscriber failed");
+    } else {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(Level::WARN)
+            .with_writer(std::io::stderr)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("Setting default subscriber failed");
+    }
 
     let args = Args::parse();
 
@@ -187,7 +207,9 @@ async fn main() -> anyhow::Result<()> {
                         let _ = tx_to_ui.send(ui::app::UiEvent::LLMResponse(response)).await;
                     }
                     Err(e) => {
-                        let _ = tx_to_ui.send(ui::app::UiEvent::LLMError(e.to_string())).await;
+                        let _ = tx_to_ui
+                            .send(ui::app::UiEvent::LLMError(e.to_string()))
+                            .await;
                     }
                 }
             }
@@ -214,7 +236,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Prints the session cost summary to stderr (if any cost was incurred).
-fn print_cost_summary(cost_tracker: &std::sync::Arc<std::sync::Mutex<crate::engine::cost_tracker::CostTracker>>) {
+fn print_cost_summary(
+    cost_tracker: &std::sync::Arc<std::sync::Mutex<crate::engine::cost_tracker::CostTracker>>,
+) {
     if let Ok(tracker) = cost_tracker.lock() {
         if tracker.total_cost_usd > 0.0 {
             eprintln!("\n{}", tracker.format_total_cost());

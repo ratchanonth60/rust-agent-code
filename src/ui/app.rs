@@ -4,26 +4,37 @@
 //! Uses typed [`MessageEntry`] variants to render user, assistant, tool, and
 //! permission messages with the correct visual style.
 
-use crossterm::event::{self, Event, KeyCode};
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, MouseEventKind};
 use ratatui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
-    Frame,
-    Terminal,
+    Frame, Terminal,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use anyhow::Result;
 use tokio::sync::{mpsc, oneshot};
 
 // ── Claude Code style characters ─────────────────────────────────────────
 const ASSISTANT_PREFIX: &str = "  \u{23BF} "; // ⎿ (left square bracket extension)
-const DIVIDER_CHAR: char = '\u{2500}';         // ─ (box-drawing horizontal)
-const DOT: &str = "\u{25CF}";                  // ● (filled circle)
+const DIVIDER_CHAR: char = '\u{2500}'; // ─ (box-drawing horizontal)
+const DOT: &str = "\u{25CF}"; // ● (filled circle)
 const PROMPT_CHAR: &str = ">";
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn welcome_art() -> String {
+    use std::io::Write;
+    let msg = "R U S T   A G E N T";
+    let width = msg.len() + 4; // padding inside the speech bubble
+    let mut buf = Vec::new();
+    ferris_says::say(msg, width, &mut buf).unwrap_or_else(|_| {
+        let _ = write!(buf, "🦀 Rust Agent 🦀");
+    });
+    String::from_utf8_lossy(&buf).to_string()
+}
 
 /// Events sent from the engine background task to the TUI for rendering.
 pub enum UiEvent {
@@ -57,7 +68,11 @@ enum MessageEntry {
     /// Assistant text: "  ⎿ text"
     Assistant(String),
     /// Tool started: "  ● ToolName"  (dim while running, green when done)
-    ToolUse { name: String, done: bool, error: bool },
+    ToolUse {
+        name: String,
+        done: bool,
+        error: bool,
+    },
     /// Error message (red)
     Error(String),
     /// System/info message (dim)
@@ -65,7 +80,10 @@ enum MessageEntry {
     /// Horizontal divider
     Divider,
     /// Permission request line
-    Permission { tool_name: String, description: String },
+    Permission {
+        tool_name: String,
+        description: String,
+    },
 }
 
 pub struct App {
@@ -78,11 +96,20 @@ pub struct App {
     tx_to_engine: mpsc::Sender<String>,
     rx_from_engine: mpsc::Receiver<UiEvent>,
     bindings: Vec<crate::keybindings::ParsedBinding>,
-    scroll_offset: u16,
+    scroll_offset: u32,
+    /// Set when streaming is active to suppress the duplicate LLMResponse.
+    streamed_this_turn: bool,
+    /// True when the user has manually scrolled — suppresses auto-scroll until
+    /// a new message is submitted.
+    user_scrolled: bool,
     pending_permission: Option<PendingPermission>,
     pub cost_tracker: Option<Arc<Mutex<crate::engine::cost_tracker::CostTracker>>>,
     /// Terminal width for divider rendering.
     term_width: u16,
+    /// Conversation area height (updated each frame).
+    conv_height: u16,
+    /// True after user submits a query until the first response event arrives.
+    waiting_for_response: bool,
 }
 
 struct PendingPermission {
@@ -93,14 +120,17 @@ struct PendingPermission {
 }
 
 impl App {
-    pub fn new(tx_to_engine: mpsc::Sender<String>, rx_from_engine: mpsc::Receiver<UiEvent>) -> Self {
+    pub fn new(
+        tx_to_engine: mpsc::Sender<String>,
+        rx_from_engine: mpsc::Receiver<UiEvent>,
+    ) -> Self {
         let load_result = crate::keybindings::load_keybindings();
         if !load_result.warnings.is_empty() {
             tracing::warn!("Keybinding warnings: {:?}", load_result.warnings);
         }
         Self {
             input: String::new(),
-            messages: vec![],
+            messages: vec![MessageEntry::System(welcome_art())],
             exit: false,
             running_tool: None,
             frame_ticker: 0,
@@ -109,30 +139,41 @@ impl App {
             rx_from_engine,
             bindings: load_result.bindings,
             scroll_offset: 0,
+            streamed_this_turn: false,
+            user_scrolled: false,
             pending_permission: None,
             cost_tracker: None,
             term_width: 80,
+            conv_height: 24,
+            waiting_for_response: false,
         }
     }
 
     pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         while !self.exit {
             terminal.draw(|f| {
-                self.term_width = f.size().width;
                 self.ui(f);
             })?;
 
             while let Ok(event) = self.rx_from_engine.try_recv() {
                 match event {
                     UiEvent::LLMResponse(res) => {
-                        self.messages.push(MessageEntry::Assistant(res));
-                        self.auto_scroll();
+                        self.waiting_for_response = false;
+                        // Skip if content was already pushed by StreamEnd
+                        if self.streamed_this_turn {
+                            self.streamed_this_turn = false;
+                        } else {
+                            self.messages.push(MessageEntry::Assistant(res));
+                            self.auto_scroll();
+                        }
                     }
                     UiEvent::LLMError(err) => {
+                        self.waiting_for_response = false;
                         self.messages.push(MessageEntry::Error(err));
                         self.auto_scroll();
                     }
                     UiEvent::ToolStarted(name) => {
+                        self.waiting_for_response = false;
                         self.running_tool = Some(name.clone());
                         self.messages.push(MessageEntry::ToolUse {
                             name,
@@ -159,7 +200,9 @@ impl App {
                         }
                     }
                     UiEvent::StreamStart => {
+                        self.waiting_for_response = false;
                         self.current_stream = Some(String::new());
+                        self.streamed_this_turn = true;
                     }
                     UiEvent::StreamDelta(text) => {
                         if let Some(ref mut stream) = self.current_stream {
@@ -197,7 +240,9 @@ impl App {
             }
 
             if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
+                self.frame_ticker = self.frame_ticker.wrapping_add(1);
+                match event::read()? {
+                    Event::Key(key) => {
                     // Permission prompt intercept
                     if self.pending_permission.is_some() {
                         let response = match key.code {
@@ -232,11 +277,8 @@ impl App {
                     }
 
                     use crate::keybindings::{resolve_key, KeybindingAction, KeybindingContext};
-                    let active_contexts =
-                        vec![KeybindingContext::Global, KeybindingContext::Chat];
-                    if let Some(action) =
-                        resolve_key(&key, &active_contexts, &self.bindings)
-                    {
+                    let active_contexts = vec![KeybindingContext::Global, KeybindingContext::Chat];
+                    if let Some(action) = resolve_key(&key, &active_contexts, &self.bindings) {
                         match action {
                             KeybindingAction::AppInterrupt | KeybindingAction::AppExit => {
                                 self.exit = true;
@@ -251,10 +293,11 @@ impl App {
                                     self.input.clear();
                                 } else if !submitted.is_empty() {
                                     self.messages.push(MessageEntry::Divider);
-                                    self.messages
-                                        .push(MessageEntry::User(submitted.clone()));
+                                    self.messages.push(MessageEntry::User(submitted.clone()));
                                     let _ = self.tx_to_engine.send(submitted).await;
                                     self.input.clear();
+                                    self.user_scrolled = false;
+                                    self.waiting_for_response = true;
                                     self.auto_scroll();
                                 }
                             }
@@ -270,10 +313,41 @@ impl App {
                             KeyCode::Backspace => {
                                 self.input.pop();
                             }
+                            KeyCode::Up => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                            }
+                            KeyCode::PageUp => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_add(10);
+                            }
                             _ => {}
                         }
                     }
-                }
+                } // end Event::Key
+                    Event::Mouse(mouse) => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                } // end match event
             } else {
                 self.frame_ticker = self.frame_ticker.wrapping_add(1);
             }
@@ -282,29 +356,52 @@ impl App {
     }
 
     fn auto_scroll(&mut self) {
-        let total_lines: usize = self
-            .messages
-            .iter()
-            .map(|m| self.entry_line_count(m))
-            .sum();
+        if self.user_scrolled {
+            return;
+        }
+        let total_lines: usize = self.messages.iter().map(|m| self.entry_line_count(m)).sum();
         let stream_lines = self
             .current_stream
             .as_ref()
-            .map(|s| s.lines().count().max(1) + 1)
+            .map(|s| self.wrapped_line_count(s, ASSISTANT_PREFIX.len()))
             .unwrap_or(0);
-        self.scroll_offset = (total_lines + stream_lines).saturating_sub(10) as u16;
+        let visible = self.conv_height as usize;
+        self.scroll_offset = (total_lines + stream_lines).saturating_sub(visible) as u32;
     }
 
+    /// Count visual lines for a message, accounting for soft wrapping.
     fn entry_line_count(&self, entry: &MessageEntry) -> usize {
+        let w = self.term_width.saturating_sub(2) as usize; // same padding as render
+        if w == 0 {
+            return 1;
+        }
         match entry {
-            MessageEntry::User(t) | MessageEntry::Assistant(t) | MessageEntry::Error(t) => {
-                t.lines().count().max(1)
-            }
-            MessageEntry::System(t) => t.lines().count().max(1),
+            MessageEntry::User(t) => self.wrapped_line_count(t, 2), // "> " prefix
+            MessageEntry::Assistant(t) => self.wrapped_line_count(t, ASSISTANT_PREFIX.len()),
+            MessageEntry::Error(t) => self.wrapped_line_count(t, ASSISTANT_PREFIX.len()),
+            MessageEntry::System(t) => self.wrapped_line_count(t, 0),
             MessageEntry::ToolUse { .. } => 1,
             MessageEntry::Divider => 1,
             MessageEntry::Permission { .. } => 2,
         }
+    }
+
+    /// Count visual lines after soft wrapping, given a prefix width.
+    fn wrapped_line_count(&self, text: &str, prefix_len: usize) -> usize {
+        let w = self.term_width.saturating_sub(2) as usize;
+        if w == 0 {
+            return text.lines().count().max(1);
+        }
+        let mut count = 0usize;
+        for line in text.lines() {
+            let total_chars = prefix_len + line.len();
+            if total_chars == 0 {
+                count += 1;
+            } else {
+                count += (total_chars + w - 1) / w; // ceil division
+            }
+        }
+        count.max(1)
     }
 
     fn handle_slash_command(&mut self, cmd: &str) {
@@ -350,8 +447,9 @@ impl App {
 
     // ── Rendering ────────────────────────────────────────────────────────
 
-    fn ui(&self, f: &mut Frame) {
+    fn ui(&mut self, f: &mut Frame) {
         let area = f.size();
+        self.term_width = area.width;
 
         // Layout: [conversation] [status line] [prompt]
         let chunks = Layout::default()
@@ -363,6 +461,7 @@ impl App {
             ])
             .split(area);
 
+        self.conv_height = chunks[0].height;
         self.render_conversation(f, chunks[0]);
         self.render_status_line(f, chunks[1]);
         self.render_prompt(f, chunks[2]);
@@ -380,7 +479,9 @@ impl App {
                         lines.push(Line::from(vec![
                             Span::styled(
                                 format!("{} ", PROMPT_CHAR),
-                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(line.to_string(), Style::default().fg(Color::White)),
                         ]));
@@ -396,41 +497,45 @@ impl App {
                     }
                 }
                 MessageEntry::ToolUse { name, done, error } => {
-                    let (dot_style, name_style) = if *error {
-                        (
-                            Style::default().fg(Color::Red),
-                            Style::default().fg(Color::Red),
-                        )
+                    if *error {
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(DOT, Style::default().fg(Color::Red)),
+                            Span::raw(" "),
+                            Span::styled(name.clone(), Style::default().fg(Color::Red)),
+                        ]));
                     } else if *done {
-                        (
-                            Style::default().fg(Color::Green),
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                        )
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(DOT, Style::default().fg(Color::Green)),
+                            Span::raw(" "),
+                            Span::styled(
+                                name.clone(),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
                     } else {
-                        // blinking dim dot for in-progress
-                        let vis = if self.frame_ticker % 10 < 5 {
-                            Style::default().fg(Color::DarkGray)
-                        } else {
-                            Style::default().fg(Color::Black)
-                        };
-                        (vis, Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
-                    };
-
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(DOT, dot_style),
-                        Span::raw(" "),
-                        Span::styled(name.clone(), name_style),
-                    ]));
+                        let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(spinner.to_string(), Style::default().fg(Color::Cyan)),
+                            Span::raw(" "),
+                            Span::styled(
+                                name.clone(),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
                 }
                 MessageEntry::Error(text) => {
                     for line in text.lines() {
                         lines.push(Line::from(vec![
                             Span::styled(ASSISTANT_PREFIX.to_string(), dim),
-                            Span::styled(
-                                line.to_string(),
-                                Style::default().fg(Color::Red),
-                            ),
+                            Span::styled(line.to_string(), Style::default().fg(Color::Red)),
                         ]));
                     }
                 }
@@ -440,8 +545,7 @@ impl App {
                     }
                 }
                 MessageEntry::Divider => {
-                    let divider: String =
-                        std::iter::repeat(DIVIDER_CHAR).take(w.min(80)).collect();
+                    let divider: String = std::iter::repeat(DIVIDER_CHAR).take(w.min(80)).collect();
                     lines.push(Line::from(Span::styled(divider, dim)));
                 }
                 MessageEntry::Permission {
@@ -469,6 +573,23 @@ impl App {
             }
         }
 
+        // Thinking spinner
+        if self.waiting_for_response {
+            let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", spinner),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    "Thinking...",
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
+
         // Streaming text
         if let Some(ref stream) = self.current_stream {
             if !stream.is_empty() {
@@ -479,30 +600,29 @@ impl App {
                         Span::raw(line.to_string()),
                     ]));
                 }
+            } else {
+                // Empty stream — push a blank streaming line for the cursor
+                lines.push(Line::from(vec![
+                    Span::styled(ASSISTANT_PREFIX.to_string(), dim),
+                ]));
             }
-            // Blinking cursor
+            // Blinking cursor — always on the last streaming line
             let cursor = if self.frame_ticker % 10 < 5 {
                 "\u{2588}" // full block
             } else {
                 " "
             };
-            let last_idx = lines.len().saturating_sub(1);
-            if let Some(last) = lines.get_mut(last_idx) {
+            if let Some(last) = lines.last_mut() {
                 last.spans.push(Span::styled(
                     cursor.to_string(),
                     Style::default().fg(Color::DarkGray),
                 ));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    cursor.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )));
             }
         }
 
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .scroll((self.scroll_offset, 0));
+            .scroll((self.scroll_offset.min(u16::MAX as u32) as u16, 0));
 
         f.render_widget(para, area);
     }
@@ -516,6 +636,9 @@ impl App {
             format!(" {} ...", tool)
         } else if self.current_stream.is_some() {
             " streaming...".to_string()
+        } else if self.waiting_for_response {
+            let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
+            format!(" {} thinking...", spinner)
         } else {
             String::new()
         };
@@ -575,10 +698,7 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(self.input.clone()),
-                Span::styled(
-                    cursor_vis.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(cursor_vis.to_string(), Style::default().fg(Color::DarkGray)),
             ]);
             f.render_widget(Paragraph::new(vec![line]), area);
         }
