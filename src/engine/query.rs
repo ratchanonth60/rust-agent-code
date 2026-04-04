@@ -1167,7 +1167,7 @@ fn get_model_pricing(model: &str) -> ModelPricing {
     let m = model.to_lowercase();
     PRICING_TABLE
         .iter()
-        .find(|e| m.contains(e.primary) && e.secondary.map_or(true, |s| m.contains(s)))
+        .find(|e| m.contains(e.primary) && e.secondary.is_none_or(|s| m.contains(s)))
         .map_or(ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }, |e| e.price)
 }
 

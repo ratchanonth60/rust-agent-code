@@ -498,7 +498,7 @@ impl App {
             if total_chars == 0 {
                 count += 1;
             } else {
-                count += (total_chars + w - 1) / w; // ceil division
+                count += total_chars.div_ceil(w);
             }
         }
         count.max(1)

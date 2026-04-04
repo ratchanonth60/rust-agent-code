@@ -24,7 +24,7 @@ impl CommandRegistry {
     /// Find a command by name or alias (without the leading `/`).
     pub fn find(&self, name: &str) -> Option<&dyn Command> {
         self.commands.iter().find_map(|cmd| {
-            if cmd.name() == name || cmd.aliases().iter().any(|a| *a == name) {
+            if cmd.name() == name || cmd.aliases().contains(&name) {
                 Some(cmd.as_ref())
             } else {
                 None

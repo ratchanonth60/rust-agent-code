@@ -92,10 +92,9 @@ impl Dialog for ModelPickerDialog {
         f.render_widget(Clear, rect);
 
         let mut lines: Vec<Line> = Vec::new();
-        let mut provider_idx = 0;
         let mut item_idx = 0;
 
-        for (provider, models) in MODELS {
+        for (provider_idx, (provider, models)) in MODELS.iter().enumerate() {
             if provider_idx > 0 {
                 lines.push(Line::from(""));
             }
@@ -122,7 +121,6 @@ impl Dialog for ModelPickerDialog {
                 )));
                 item_idx += 1;
             }
-            provider_idx += 1;
         }
 
         let block = Block::default()

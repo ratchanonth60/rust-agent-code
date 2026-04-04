@@ -58,10 +58,10 @@ fn parse_skill_file(path: &PathBuf) -> Option<Skill> {
     let mut prompt = content.clone();
 
     // Try to parse frontmatter
-    if content.starts_with("---") {
-        if let Some(end_idx) = content[3..].find("---") {
-            let frontmatter = &content[3..3 + end_idx];
-            prompt = content[3 + end_idx + 3..].trim().to_string();
+    if let Some(after_prefix) = content.strip_prefix("---") {
+        if let Some(end_idx) = after_prefix.find("---") {
+            let frontmatter = &after_prefix[..end_idx];
+            prompt = after_prefix[end_idx + 3..].trim().to_string();
 
             for line in frontmatter.lines() {
                 let line = line.trim();

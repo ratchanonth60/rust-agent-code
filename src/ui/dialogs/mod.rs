@@ -13,20 +13,15 @@ use ratatui::{
 };
 
 /// Which dialog is currently active (if any).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ActiveDialog {
     /// No dialog open.
+    #[default]
     None,
     /// Model selection dialog.
     ModelPicker,
     /// Theme selection dialog.
     ThemePicker,
-}
-
-impl Default for ActiveDialog {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Common trait for dialog widgets.

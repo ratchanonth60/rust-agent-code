@@ -108,6 +108,7 @@ impl TaskManager {
                             let _ = stderr.read_to_string(&mut buf);
                             task.stderr = buf;
                         }
+                        let _ = child.wait();
                         task.status = if exit_status.success() {
                             TaskStatus::Completed
                         } else {

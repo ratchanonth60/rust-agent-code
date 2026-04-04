@@ -18,7 +18,7 @@
 /// ```
 pub fn estimate_tokens(text: &str) -> u64 {
     let len = text.len() as u64;
-    (len + 3) / 4 // ceiling division
+    len.div_ceil(4)
 }
 
 /// Estimates total tokens for a serialised conversation.
