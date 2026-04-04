@@ -4,6 +4,10 @@
 //! and [`restore_terminal`] (or the panic hook) to leave it cleanly.
 
 pub mod app;
+pub mod dialogs;
+pub mod diff_viewer;
+pub mod highlight;
+pub mod markdown;
 
 use anyhow::Result;
 use crossterm::{
