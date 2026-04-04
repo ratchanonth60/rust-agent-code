@@ -14,8 +14,9 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::commands::{CommandContext, CommandRegistry, CommandResult};
@@ -27,6 +28,9 @@ const DIVIDER_CHAR: char = '\u{2500}'; // ─ (box-drawing horizontal)
 const DOT: &str = "\u{25CF}"; // ● (filled circle)
 const PROMPT_CHAR: &str = ">";
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const AUTOCOMPLETE_MAX_ITEMS: usize = 5;
+const FILE_SCAN_MAX: usize = 5000;
+const FILE_SUGGEST_DEBOUNCE: Duration = Duration::from_millis(50);
 
 fn welcome_art() -> String {
     use std::io::Write;
@@ -95,6 +99,19 @@ enum MessageEntry {
     },
 }
 
+#[derive(Clone)]
+enum AutocompleteKind {
+    Command,
+    File,
+}
+
+#[derive(Clone)]
+struct AutocompleteItem {
+    display: String,
+    insert: String,
+    kind: AutocompleteKind,
+}
+
 pub struct App {
     pub input: String,
     messages: Vec<MessageEntry>,
@@ -131,6 +148,18 @@ pub struct App {
     history_draft: Option<String>,
     /// Registry of slash commands.
     command_registry: CommandRegistry,
+    /// Active autocomplete candidates.
+    autocomplete_items: Vec<AutocompleteItem>,
+    /// Selected autocomplete row.
+    autocomplete_selected: usize,
+    /// Prevent immediate reopen after explicit dismiss.
+    autocomplete_dismissed_input: Option<String>,
+    /// Marks input-driven autocomplete state as stale.
+    autocomplete_dirty: bool,
+    /// Timestamp of latest file completion refresh.
+    last_file_refresh: Option<Instant>,
+    /// Cached workspace file index for file suggestions.
+    file_index: Option<Vec<String>>,
 }
 
 struct PendingPermission {
@@ -180,6 +209,12 @@ impl App {
             history_cursor: None,
             history_draft: None,
             command_registry,
+            autocomplete_items: Vec::new(),
+            autocomplete_selected: 0,
+            autocomplete_dismissed_input: None,
+            autocomplete_dirty: true,
+            last_file_refresh: None,
+            file_index: None,
         }
     }
 
@@ -273,6 +308,8 @@ impl App {
                 }
             }
 
+            self.maybe_refresh_autocomplete();
+
             // Poll for incoming questions from AskUserQuestionTool
             while let Ok(qreq) = self.rx_questions.try_recv() {
                 let mut question_text = format!("  ? {}", qreq.question);
@@ -311,8 +348,14 @@ impl App {
                             continue;
                         }
                         match key.code {
-                            KeyCode::Char(c) => self.input.push(c),
-                            KeyCode::Backspace => { self.input.pop(); }
+                            KeyCode::Char(c) => {
+                                self.input.push(c);
+                                self.mark_autocomplete_dirty();
+                            }
+                            KeyCode::Backspace => {
+                                self.input.pop();
+                                self.mark_autocomplete_dirty();
+                            }
                             _ => {}
                         }
                         continue;
@@ -352,7 +395,10 @@ impl App {
                     }
 
                     use crate::keybindings::{resolve_key, KeybindingAction, KeybindingContext};
-                    let active_contexts = vec![KeybindingContext::Global, KeybindingContext::Chat];
+                    let mut active_contexts = vec![KeybindingContext::Global, KeybindingContext::Chat];
+                    if self.is_autocomplete_visible() {
+                        active_contexts.push(KeybindingContext::Autocomplete);
+                    }
                     if let Some(action) = resolve_key(&key, &active_contexts, &self.bindings) {
                         match action {
                             KeybindingAction::AppInterrupt | KeybindingAction::AppExit => {
@@ -378,6 +424,7 @@ impl App {
                                 } else if submitted.starts_with('/') {
                                     self.handle_slash_command(&submitted);
                                     self.input.clear();
+                                    self.clear_autocomplete();
                                 } else if !submitted.is_empty() {
                                     self.push_history_entry(submitted.clone());
                                     self.messages.push(MessageEntry::Divider);
@@ -385,6 +432,7 @@ impl App {
                                     let _ = self.tx_to_engine.send(submitted).await;
                                     self.input.clear();
                                     self.reset_history_navigation();
+                                    self.clear_autocomplete();
                                     self.user_scrolled = false;
                                     self.waiting_for_response = true;
                                     self.auto_scroll();
@@ -393,6 +441,19 @@ impl App {
                             KeybindingAction::ChatCancel => {
                                 self.input.clear();
                                 self.reset_history_navigation();
+                                self.clear_autocomplete();
+                            }
+                            KeybindingAction::AutocompleteAccept => {
+                                self.accept_autocomplete();
+                            }
+                            KeybindingAction::AutocompleteDismiss => {
+                                self.dismiss_autocomplete();
+                            }
+                            KeybindingAction::AutocompletePrevious => {
+                                self.autocomplete_previous();
+                            }
+                            KeybindingAction::AutocompleteNext => {
+                                self.autocomplete_next();
                             }
                             KeybindingAction::HistoryPrevious => {
                                 self.navigate_history_previous();
@@ -406,11 +467,13 @@ impl App {
                         match key.code {
                             KeyCode::Char(c) => {
                                 self.reset_history_navigation();
-                                self.input.push(c)
+                                self.input.push(c);
+                                self.mark_autocomplete_dirty();
                             }
                             KeyCode::Backspace => {
                                 self.reset_history_navigation();
                                 self.input.pop();
+                                self.mark_autocomplete_dirty();
                             }
                             KeyCode::Up => {
                                 self.user_scrolled = true;
@@ -498,7 +561,7 @@ impl App {
             if total_chars == 0 {
                 count += 1;
             } else {
-                count += total_chars.div_ceil(w);
+                count += (total_chars + w - 1) / w; // ceil division
             }
         }
         count.max(1)
@@ -570,6 +633,249 @@ impl App {
         self.auto_scroll();
     }
 
+    fn is_autocomplete_visible(&self) -> bool {
+        self.pending_permission.is_none()
+            && self.pending_question.is_none()
+            && !self.autocomplete_items.is_empty()
+    }
+
+    fn mark_autocomplete_dirty(&mut self) {
+        self.autocomplete_dirty = true;
+        if self
+            .autocomplete_dismissed_input
+            .as_ref()
+            .map(|d| d != &self.input)
+            .unwrap_or(false)
+        {
+            self.autocomplete_dismissed_input = None;
+        }
+    }
+
+    fn clear_autocomplete(&mut self) {
+        self.autocomplete_items.clear();
+        self.autocomplete_selected = 0;
+        self.autocomplete_dismissed_input = None;
+        self.autocomplete_dirty = false;
+    }
+
+    fn maybe_refresh_autocomplete(&mut self) {
+        if !self.autocomplete_dirty {
+            return;
+        }
+        if self.pending_permission.is_some() || self.pending_question.is_some() {
+            self.autocomplete_items.clear();
+            self.autocomplete_selected = 0;
+            self.autocomplete_dirty = false;
+            return;
+        }
+
+        if self
+            .autocomplete_dismissed_input
+            .as_ref()
+            .map(|d| d == &self.input)
+            .unwrap_or(false)
+        {
+            self.autocomplete_items.clear();
+            self.autocomplete_selected = 0;
+            self.autocomplete_dirty = false;
+            return;
+        }
+
+        let mut next_items = self.build_command_suggestions();
+        if next_items.is_empty() {
+            if let Some(query) = self.extract_file_query() {
+                let should_debounce = self
+                    .last_file_refresh
+                    .map(|t| t.elapsed() < FILE_SUGGEST_DEBOUNCE)
+                    .unwrap_or(false);
+                if should_debounce {
+                    return;
+                }
+                next_items = self.build_file_suggestions(&query);
+                self.last_file_refresh = Some(Instant::now());
+            }
+        }
+
+        self.autocomplete_items = next_items;
+        if self.autocomplete_selected >= self.autocomplete_items.len() {
+            self.autocomplete_selected = 0;
+        }
+        self.autocomplete_dirty = false;
+    }
+
+    fn build_command_suggestions(&self) -> Vec<AutocompleteItem> {
+        let token = self.input.split_whitespace().next().unwrap_or("");
+        if !token.starts_with('/') {
+            return Vec::new();
+        }
+
+        let needle = token.trim_start_matches('/').to_lowercase();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut scored: Vec<(usize, String)> = Vec::new();
+
+        for command in self.command_registry.list() {
+            let mut candidates = vec![command.name().to_string()];
+            candidates.extend(command.aliases().into_iter().map(|a| a.to_string()));
+            for name in candidates {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let lower = name.to_lowercase();
+                if needle.is_empty() || lower.contains(&needle) {
+                    let score = if lower.starts_with(&needle) { 0 } else { 1 };
+                    scored.push((score, name));
+                }
+            }
+        }
+
+        scored.sort_by(|a, b| a.cmp(b));
+        scored
+            .into_iter()
+            .take(AUTOCOMPLETE_MAX_ITEMS)
+            .map(|(_, name)| AutocompleteItem {
+                display: format!("/{}", name),
+                insert: format!("/{} ", name),
+                kind: AutocompleteKind::Command,
+            })
+            .collect()
+    }
+
+    fn extract_file_query(&self) -> Option<String> {
+        let token = self.input.split_whitespace().last()?;
+        if token.starts_with('@') {
+            Some(token.trim_start_matches('@').to_lowercase())
+        } else {
+            None
+        }
+    }
+
+    fn build_file_suggestions(&mut self, query: &str) -> Vec<AutocompleteItem> {
+        if self.file_index.is_none() {
+            self.file_index = Some(self.scan_workspace_files());
+        }
+        let files = self.file_index.clone().unwrap_or_default();
+        let mut scored: Vec<(usize, String)> = files
+            .into_iter()
+            .filter_map(|path| {
+                let lower = path.to_lowercase();
+                if query.is_empty() || lower.contains(query) {
+                    let score = if lower.starts_with(query) { 0 } else { 1 };
+                    Some((score, path))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        scored.sort_by(|a, b| a.cmp(b));
+
+        scored
+            .into_iter()
+            .take(AUTOCOMPLETE_MAX_ITEMS)
+            .map(|(_, path)| AutocompleteItem {
+                display: format!("@{}", path),
+                insert: format!("@{}", path),
+                kind: AutocompleteKind::File,
+            })
+            .collect()
+    }
+
+    fn scan_workspace_files(&self) -> Vec<String> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>, root: &std::path::Path) {
+            if out.len() >= FILE_SCAN_MAX {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                if out.len() >= FILE_SCAN_MAX {
+                    return;
+                }
+                let path = entry.path();
+                let name = entry.file_name();
+                if let Some(name_str) = name.to_str() {
+                    if matches!(name_str, ".git" | "target" | "node_modules") {
+                        continue;
+                    }
+                }
+                if path.is_dir() {
+                    walk(&path, out, root);
+                } else if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut out = Vec::new();
+        walk(&root, &mut out, &root);
+        out
+    }
+
+    fn accept_autocomplete(&mut self) {
+        if self.autocomplete_items.is_empty() {
+            return;
+        }
+        let idx = self
+            .autocomplete_selected
+            .min(self.autocomplete_items.len().saturating_sub(1));
+        let item = self.autocomplete_items[idx].clone();
+
+        match item.kind {
+            AutocompleteKind::Command => {
+                let mut parts = self.input.splitn(2, ' ');
+                let _first = parts.next();
+                if let Some(rest) = parts.next() {
+                    self.input = format!("{}{}", item.insert, rest.trim_start());
+                } else {
+                    self.input = item.insert;
+                }
+            }
+            AutocompleteKind::File => {
+                self.input = Self::replace_last_token(&self.input, &item.insert);
+            }
+        }
+
+        self.autocomplete_items.clear();
+        self.autocomplete_selected = 0;
+        self.autocomplete_dismissed_input = None;
+        self.autocomplete_dirty = true;
+    }
+
+    fn dismiss_autocomplete(&mut self) {
+        self.autocomplete_dismissed_input = Some(self.input.clone());
+        self.autocomplete_items.clear();
+        self.autocomplete_selected = 0;
+        self.autocomplete_dirty = false;
+    }
+
+    fn autocomplete_previous(&mut self) {
+        if self.autocomplete_items.is_empty() {
+            return;
+        }
+        if self.autocomplete_selected == 0 {
+            self.autocomplete_selected = self.autocomplete_items.len() - 1;
+        } else {
+            self.autocomplete_selected -= 1;
+        }
+    }
+
+    fn autocomplete_next(&mut self) {
+        if self.autocomplete_items.is_empty() {
+            return;
+        }
+        self.autocomplete_selected = (self.autocomplete_selected + 1) % self.autocomplete_items.len();
+    }
+
+    fn replace_last_token(input: &str, replacement: &str) -> String {
+        if let Some((idx, _)) = input.char_indices().rev().find(|(_, ch)| ch.is_whitespace()) {
+            let prefix = &input[..=idx];
+            format!("{}{}", prefix, replacement)
+        } else {
+            replacement.to_string()
+        }
+    }
+
     fn push_history_entry(&mut self, submitted: String) {
         let is_duplicate = self
             .input_history
@@ -624,12 +930,19 @@ impl App {
         let area = f.size();
         self.term_width = area.width;
 
-        // Layout: [conversation] [status line] [prompt]
+        let autocomplete_height = if self.is_autocomplete_visible() {
+            self.autocomplete_items.len().min(AUTOCOMPLETE_MAX_ITEMS) as u16
+        } else {
+            0
+        };
+
+        // Layout: [conversation] [status line] [autocomplete] [prompt]
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),    // conversation
                 Constraint::Length(1), // status line
+                Constraint::Length(autocomplete_height), // autocomplete dropdown
                 Constraint::Length(1), // prompt input
             ])
             .split(area);
@@ -637,7 +950,37 @@ impl App {
         self.conv_height = chunks[0].height;
         self.render_conversation(f, chunks[0]);
         self.render_status_line(f, chunks[1]);
-        self.render_prompt(f, chunks[2]);
+        if autocomplete_height > 0 {
+            self.render_autocomplete(f, chunks[2]);
+        }
+        self.render_prompt(f, chunks[3]);
+    }
+
+    fn render_autocomplete(&self, f: &mut Frame, area: Rect) {
+        let mut lines: Vec<Line> = Vec::new();
+        for (idx, item) in self
+            .autocomplete_items
+            .iter()
+            .take(AUTOCOMPLETE_MAX_ITEMS)
+            .enumerate()
+        {
+            let selected = idx == self.autocomplete_selected;
+            let marker = if selected { "▶" } else { " " };
+            let kind = match item.kind {
+                AutocompleteKind::Command => "cmd",
+                AutocompleteKind::File => "file",
+            };
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} {} ", marker, kind), style),
+                Span::styled(item.display.clone(), style),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
     }
 
     fn render_conversation(&self, f: &mut Frame, area: Rect) {
@@ -718,7 +1061,7 @@ impl App {
                     }
                 }
                 MessageEntry::Divider => {
-                    let divider: String = std::iter::repeat_n(DIVIDER_CHAR, w.min(80)).collect();
+                    let divider: String = std::iter::repeat(DIVIDER_CHAR).take(w.min(80)).collect();
                     lines.push(Line::from(Span::styled(divider, dim)));
                 }
                 MessageEntry::Permission {
@@ -840,7 +1183,7 @@ impl App {
         };
 
         let fill_len = w.saturating_sub(left.len() + right.len());
-        let fill: String = std::iter::repeat_n(DIVIDER_CHAR, fill_len).collect();
+        let fill: String = std::iter::repeat(DIVIDER_CHAR).take(fill_len).collect();
 
         let line = Line::from(vec![
             Span::styled(left, dim),
