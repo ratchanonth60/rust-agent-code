@@ -3,6 +3,7 @@
 use super::types::Command;
 
 /// Holds all registered slash commands and provides lookup by name/alias.
+#[derive(Default)]
 pub struct CommandRegistry {
     commands: Vec<Box<dyn Command>>,
 }

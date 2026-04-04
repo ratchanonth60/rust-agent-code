@@ -12,6 +12,7 @@ use crate::tools::glob_tool::GlobTool;
 use crate::tools::grep_tool::GrepTool;
 use crate::tools::notebook::NotebookEditTool;
 use crate::tools::plan_mode::{EnterPlanModeTool, ExitPlanModeTool};
+use crate::tools::skill_tool::SkillTool;
 use crate::tools::sleep::SleepTool;
 use crate::tools::tasks::{self, BackgroundTaskTool, TaskOutputTool, TaskStopTool};
 use crate::tools::todo::{SharedTodoList, TodoWriteTool};
@@ -69,5 +70,7 @@ pub fn default_tools(
         Box::new(AskUserQuestionTool::new(question_tx)),
         // Configuration
         Box::new(ConfigTool),
+        // Skills
+        Box::new(SkillTool),
     ]
 }

@@ -34,6 +34,7 @@ struct Task {
 }
 
 /// Manages background tasks for the session.
+#[derive(Default)]
 pub struct TaskManager {
     tasks: HashMap<String, Task>,
     next_id: u32,
