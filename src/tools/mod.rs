@@ -17,6 +17,7 @@ pub mod registry;
 pub mod skill_tool;
 pub mod sleep;
 pub mod tasks;
+pub mod teams;
 pub mod todo;
 pub mod web_fetch;
 pub mod web_search;
