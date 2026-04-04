@@ -28,14 +28,9 @@ use tracing::info;
 
 use crate::engine::config::EngineConfig;
 use crate::engine::cost_tracker::CostTracker;
+use crate::engine::session::Session;
 use crate::permissions::{PermissionDecision, PermissionRule, check_permission};
-use crate::tools::{
-    fs::ReadFileTool, fs::WriteFileTool, bash::BashTool,
-    edit::FileEditTool, glob_tool::GlobTool, grep_tool::GrepTool,
-    todo::TodoWriteTool, sleep::SleepTool, web_fetch::WebFetchTool,
-    ask_user::AskUserQuestionTool,
-    Tool, ToolContext,
-};
+use crate::tools::{Tool, ToolContext};
 
 /// LLM provider selection.
 ///
@@ -67,16 +62,23 @@ pub struct QueryEngine {
     pub cwd: std::path::PathBuf,
     /// Shared todo list state.
     pub todo_list: crate::tools::todo::SharedTodoList,
+    /// Active session for auto-save persistence.
+    pub session: Arc<Mutex<Session>>,
 }
 
 impl QueryEngine {
     /// Create a new QueryEngine specifying the provider and optional API overrides.
+    ///
+    /// `question_tx` is an optional channel sender for forwarding
+    /// [`AskUserQuestionTool`] questions to the TUI.  Pass `None` in
+    /// headless / bare mode.
     pub fn new(
         model: impl Into<String>,
         provider: ModelProvider,
         api_key: Option<String>,
         api_base: Option<String>,
         config: EngineConfig,
+        question_tx: Option<crate::tools::ask_user::QuestionSender>,
     ) -> Result<Self> {
         let openai_client = match provider {
             // Claude and Gemini have their own HTTP paths; no async_openai client needed.
@@ -127,31 +129,29 @@ impl QueryEngine {
         };
 
         let todo_list = crate::tools::todo::new_shared_todo_list();
+        let tools = crate::tools::registry::default_tools(todo_list.clone(), question_tx);
+        let model_str: String = model.into();
 
-        let tools: Vec<Box<dyn Tool + Send + Sync>> = vec![
-            Box::new(ReadFileTool),
-            Box::new(WriteFileTool),
-            Box::new(BashTool),
-            Box::new(FileEditTool),
-            Box::new(GlobTool),
-            Box::new(GrepTool),
-            Box::new(TodoWriteTool { todos: todo_list.clone() }),
-            Box::new(SleepTool),
-            Box::new(WebFetchTool),
-            Box::new(AskUserQuestionTool::new(None)), // TUI channel wired later if needed
-        ];
+        // Create a session for auto-save persistence
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let session = Session::new(
+            session_id,
+            model_str.clone(),
+            format!("{:?}", provider),
+        );
 
         Ok(Self {
             provider,
             openai_client,
             http_client: reqwest::Client::new(),
-            model: model.into(),
+            model: model_str,
             tools,
             config,
             cost_tracker: Arc::new(Mutex::new(CostTracker::new())),
             permission_rules: Arc::new(Mutex::new(Vec::new())),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             todo_list,
+            session: Arc::new(Mutex::new(session)),
         })
     }
 
@@ -311,11 +311,18 @@ impl QueryEngine {
         
         // 3. Setup ToolContext driven by EngineConfig
         let tool_names = self.tools.iter().map(|t| t.name().to_string()).collect();
+        let session_id = self.session.lock()
+            .map(|s| s.id.clone())
+            .ok();
         let ctx = ToolContext {
             auto_mode: self.config.auto_mode,
             debug: self.config.debug,
             tools_available: tool_names,
             max_budget_usd: self.config.max_budget_usd,
+            cwd: self.cwd.clone(),
+            permission_mode: self.config.permission_mode,
+            session_id,
+            is_agent: false,
         };
 
         // Pre-compute context window for compaction
@@ -485,6 +492,9 @@ impl QueryEngine {
                     "content":      result_content,
                 }));
             }
+
+            // Auto-save session after Gemini tool-use round-trip
+            self.auto_save_session(&messages);
         }
     }
 
@@ -637,6 +647,12 @@ impl QueryEngine {
                         );
                     }
                 }
+
+                // Auto-save session after OpenAI tool-use round-trip
+                let json_msgs: Vec<Value> = messages.iter()
+                    .filter_map(|m| serde_json::to_value(m).ok())
+                    .collect();
+                self.auto_save_session(&json_msgs);
             } else {
                 // No tool calls, return purely text content
                 return Ok(message.content.clone().unwrap_or_default());
@@ -845,6 +861,12 @@ impl QueryEngine {
                     content: tool_result_blocks,
                 });
 
+                // Auto-save session after tool-use round-trip
+                let json_msgs: Vec<Value> = messages.iter()
+                    .filter_map(|m| serde_json::to_value(m).ok())
+                    .collect();
+                self.auto_save_session(&json_msgs);
+
             // ---- Non-streaming path (one-shot / bare mode) ----
             } else {
                 let api_response: ClaudeMessagesResponse = response.json().await?;
@@ -892,6 +914,26 @@ impl QueryEngine {
                     role: "user".to_string(),
                     content: tool_result_blocks,
                 });
+
+                // Auto-save session after non-streaming tool-use round-trip
+                let json_msgs: Vec<Value> = messages.iter()
+                    .filter_map(|m| serde_json::to_value(m).ok())
+                    .collect();
+                self.auto_save_session(&json_msgs);
+            }
+        }
+    }
+
+    /// Persist the current conversation state to disk after each tool-use round-trip.
+    ///
+    /// Serialises the provider-specific message history into the session's
+    /// `messages` vec and calls [`Session::save`].  Errors are logged but
+    /// do not abort the agentic loop.
+    fn auto_save_session(&self, messages: &[Value]) {
+        if let Ok(mut session) = self.session.lock() {
+            session.messages = messages.to_vec();
+            if let Err(e) = session.save() {
+                info!("Auto-save failed: {}", e);
             }
         }
     }
@@ -1125,7 +1167,7 @@ fn get_model_pricing(model: &str) -> ModelPricing {
     let m = model.to_lowercase();
     PRICING_TABLE
         .iter()
-        .find(|e| m.contains(e.primary) && e.secondary.map_or(true, |s| m.contains(s)))
+        .find(|e| m.contains(e.primary) && e.secondary.is_none_or(|s| m.contains(s)))
         .map_or(ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }, |e| e.price)
 }
 

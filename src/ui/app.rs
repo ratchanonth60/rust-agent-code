@@ -4,26 +4,44 @@
 //! Uses typed [`MessageEntry`] variants to render user, assistant, tool, and
 //! permission messages with the correct visual style.
 
-use crossterm::event::{self, Event, KeyCode};
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, MouseEventKind};
 use ratatui::{
     backend::Backend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
-    Frame,
-    Terminal,
+    Frame, Terminal,
 };
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use anyhow::Result;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::commands::{CommandContext, CommandRegistry, CommandResult};
+use crate::tools::ask_user::QuestionRequest;
 
 // ── Claude Code style characters ─────────────────────────────────────────
 const ASSISTANT_PREFIX: &str = "  \u{23BF} "; // ⎿ (left square bracket extension)
-const DIVIDER_CHAR: char = '\u{2500}';         // ─ (box-drawing horizontal)
-const DOT: &str = "\u{25CF}";                  // ● (filled circle)
+const DOT: &str = "\u{25CF}"; // ● (filled circle)
 const PROMPT_CHAR: &str = ">";
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const RAIL_FRAMES: &[char] = &['─', '╌', '┄', '╌'];
+const AUTOCOMPLETE_MAX_ITEMS: usize = 5;
+const FILE_SCAN_MAX: usize = 5000;
+const FILE_SUGGEST_DEBOUNCE: Duration = Duration::from_millis(50);
+
+fn welcome_art() -> String {
+    use std::io::Write;
+    let msg = "R U S T   A G E N T";
+    let width = msg.len() + 4; // padding inside the speech bubble
+    let mut buf = Vec::new();
+    ferris_says::say(msg, width, &mut buf).unwrap_or_else(|_| {
+        let _ = write!(buf, "🦀 Rust Agent 🦀");
+    });
+    String::from_utf8_lossy(&buf).to_string()
+}
 
 /// Events sent from the engine background task to the TUI for rendering.
 pub enum UiEvent {
@@ -57,7 +75,11 @@ enum MessageEntry {
     /// Assistant text: "  ⎿ text"
     Assistant(String),
     /// Tool started: "  ● ToolName"  (dim while running, green when done)
-    ToolUse { name: String, done: bool, error: bool },
+    ToolUse {
+        name: String,
+        done: bool,
+        error: bool,
+    },
     /// Error message (red)
     Error(String),
     /// System/info message (dim)
@@ -65,7 +87,29 @@ enum MessageEntry {
     /// Horizontal divider
     Divider,
     /// Permission request line
-    Permission { tool_name: String, description: String },
+    Permission {
+        tool_name: String,
+        description: String,
+    },
+    /// Interactive question from AskUserQuestionTool
+    Question {
+        question: String,
+        #[allow(dead_code)]
+        options: Vec<String>,
+    },
+}
+
+#[derive(Clone)]
+enum AutocompleteKind {
+    Command,
+    File,
+}
+
+#[derive(Clone)]
+struct AutocompleteItem {
+    display: String,
+    insert: String,
+    kind: AutocompleteKind,
 }
 
 pub struct App {
@@ -77,12 +121,45 @@ pub struct App {
     pub current_stream: Option<String>,
     tx_to_engine: mpsc::Sender<String>,
     rx_from_engine: mpsc::Receiver<UiEvent>,
+    /// Receiver for interactive questions from AskUserQuestionTool.
+    rx_questions: mpsc::Receiver<QuestionRequest>,
     bindings: Vec<crate::keybindings::ParsedBinding>,
-    scroll_offset: u16,
+    scroll_offset: u32,
+    /// Set when streaming is active to suppress the duplicate LLMResponse.
+    streamed_this_turn: bool,
+    /// True when the user has manually scrolled — suppresses auto-scroll until
+    /// a new message is submitted.
+    user_scrolled: bool,
     pending_permission: Option<PendingPermission>,
+    /// Pending question from AskUserQuestionTool awaiting user input.
+    pending_question: Option<PendingQuestion>,
     pub cost_tracker: Option<Arc<Mutex<crate::engine::cost_tracker::CostTracker>>>,
     /// Terminal width for divider rendering.
     term_width: u16,
+    /// Conversation area height (updated each frame).
+    conv_height: u16,
+    /// True after user submits a query until the first response event arrives.
+    waiting_for_response: bool,
+    /// Submitted chat inputs (newest at the end) for up/down recall.
+    input_history: Vec<String>,
+    /// Cursor into `input_history` while browsing; `None` means not browsing.
+    history_cursor: Option<usize>,
+    /// Draft input captured before entering history navigation.
+    history_draft: Option<String>,
+    /// Registry of slash commands.
+    command_registry: CommandRegistry,
+    /// Current autocomplete candidate list.
+    autocomplete_items: Vec<AutocompleteItem>,
+    /// Selected item index in `autocomplete_items`.
+    autocomplete_selected: usize,
+    /// Last input string explicitly dismissed by autocomplete escape.
+    autocomplete_dismissed_input: Option<String>,
+    /// Set when input changed and autocomplete should recompute.
+    autocomplete_dirty: bool,
+    /// Last timestamp of file suggestion recompute for debounce.
+    last_file_refresh: Option<Instant>,
+    /// Cached workspace file index for file autocomplete.
+    file_index: Option<Vec<String>>,
 }
 
 struct PendingPermission {
@@ -92,47 +169,80 @@ struct PendingPermission {
     response_tx: oneshot::Sender<PermissionResponse>,
 }
 
+/// A question from `AskUserQuestionTool` waiting for the user's typed answer.
+struct PendingQuestion {
+    response_tx: oneshot::Sender<String>,
+}
+
 impl App {
-    pub fn new(tx_to_engine: mpsc::Sender<String>, rx_from_engine: mpsc::Receiver<UiEvent>) -> Self {
+    pub fn new(
+        tx_to_engine: mpsc::Sender<String>,
+        rx_from_engine: mpsc::Receiver<UiEvent>,
+        rx_questions: mpsc::Receiver<QuestionRequest>,
+        command_registry: CommandRegistry,
+    ) -> Self {
         let load_result = crate::keybindings::load_keybindings();
         if !load_result.warnings.is_empty() {
             tracing::warn!("Keybinding warnings: {:?}", load_result.warnings);
         }
         Self {
             input: String::new(),
-            messages: vec![],
+            messages: vec![MessageEntry::System(welcome_art())],
             exit: false,
             running_tool: None,
             frame_ticker: 0,
             current_stream: None,
             tx_to_engine,
             rx_from_engine,
+            rx_questions,
             bindings: load_result.bindings,
             scroll_offset: 0,
+            streamed_this_turn: false,
+            user_scrolled: false,
             pending_permission: None,
+            pending_question: None,
             cost_tracker: None,
             term_width: 80,
+            conv_height: 24,
+            waiting_for_response: false,
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: None,
+            command_registry,
+            autocomplete_items: Vec::new(),
+            autocomplete_selected: 0,
+            autocomplete_dismissed_input: None,
+            autocomplete_dirty: true,
+            last_file_refresh: None,
+            file_index: None,
         }
     }
 
     pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         while !self.exit {
             terminal.draw(|f| {
-                self.term_width = f.size().width;
                 self.ui(f);
             })?;
 
             while let Ok(event) = self.rx_from_engine.try_recv() {
                 match event {
                     UiEvent::LLMResponse(res) => {
-                        self.messages.push(MessageEntry::Assistant(res));
-                        self.auto_scroll();
+                        self.waiting_for_response = false;
+                        // Skip if content was already pushed by StreamEnd
+                        if self.streamed_this_turn {
+                            self.streamed_this_turn = false;
+                        } else {
+                            self.messages.push(MessageEntry::Assistant(res));
+                            self.auto_scroll();
+                        }
                     }
                     UiEvent::LLMError(err) => {
+                        self.waiting_for_response = false;
                         self.messages.push(MessageEntry::Error(err));
                         self.auto_scroll();
                     }
                     UiEvent::ToolStarted(name) => {
+                        self.waiting_for_response = false;
                         self.running_tool = Some(name.clone());
                         self.messages.push(MessageEntry::ToolUse {
                             name,
@@ -159,7 +269,9 @@ impl App {
                         }
                     }
                     UiEvent::StreamStart => {
+                        self.waiting_for_response = false;
                         self.current_stream = Some(String::new());
+                        self.streamed_this_turn = true;
                     }
                     UiEvent::StreamDelta(text) => {
                         if let Some(ref mut stream) = self.current_stream {
@@ -196,8 +308,59 @@ impl App {
                 }
             }
 
+            self.maybe_refresh_autocomplete();
+
+            // Poll for incoming questions from AskUserQuestionTool
+            while let Ok(qreq) = self.rx_questions.try_recv() {
+                let mut question_text = format!("  ? {}", qreq.question);
+                if !qreq.options.is_empty() {
+                    for (i, opt) in qreq.options.iter().enumerate() {
+                        question_text.push_str(&format!("\n    {}. {}", i + 1, opt));
+                    }
+                }
+                self.messages.push(MessageEntry::Question {
+                    question: question_text,
+                    options: qreq.options,
+                });
+                self.pending_question = Some(PendingQuestion {
+                    response_tx: qreq.response_tx,
+                });
+                self.auto_scroll();
+            }
+
             if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
+                self.frame_ticker = self.frame_ticker.wrapping_add(1);
+                match event::read()? {
+                    Event::Key(key) => {
+                    // Question prompt intercept — send typed answer back to AskUserQuestionTool
+                    if self.pending_question.is_some() {
+                        if let KeyCode::Enter = key.code {
+                            let answer = self.input.trim().to_string();
+                            if !answer.is_empty() {
+                                let q = self.pending_question.take().unwrap();
+                                self.messages.push(MessageEntry::System(format!(
+                                    "  → {}", answer
+                                )));
+                                let _ = q.response_tx.send(answer);
+                                self.input.clear();
+                                self.auto_scroll();
+                            }
+                            continue;
+                        }
+                        match key.code {
+                            KeyCode::Char(c) => {
+                                self.input.push(c);
+                                self.mark_autocomplete_dirty();
+                            }
+                            KeyCode::Backspace => {
+                                self.input.pop();
+                                self.mark_autocomplete_dirty();
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Permission prompt intercept
                     if self.pending_permission.is_some() {
                         let response = match key.code {
@@ -232,11 +395,11 @@ impl App {
                     }
 
                     use crate::keybindings::{resolve_key, KeybindingAction, KeybindingContext};
-                    let active_contexts =
-                        vec![KeybindingContext::Global, KeybindingContext::Chat];
-                    if let Some(action) =
-                        resolve_key(&key, &active_contexts, &self.bindings)
-                    {
+                    let mut active_contexts = vec![KeybindingContext::Global, KeybindingContext::Chat];
+                    if self.is_autocomplete_visible() {
+                        active_contexts.push(KeybindingContext::Autocomplete);
+                    }
+                    if let Some(action) = resolve_key(&key, &active_contexts, &self.bindings) {
                         match action {
                             KeybindingAction::AppInterrupt | KeybindingAction::AppExit => {
                                 self.exit = true;
@@ -244,36 +407,109 @@ impl App {
                             KeybindingAction::AppRedraw => {}
                             KeybindingAction::ChatSubmit => {
                                 let submitted = self.input.trim().to_string();
-                                if submitted == "quit" || submitted == "exit" {
+                                // If there's a pending question, the user's input
+                                // is the answer — send it back to the tool.
+                                if let Some(pq) = self.pending_question.take() {
+                                    if !submitted.is_empty() {
+                                        self.messages.push(MessageEntry::User(submitted.clone()));
+                                        let _ = pq.response_tx.send(submitted);
+                                        self.input.clear();
+                                        self.auto_scroll();
+                                    } else {
+                                        // Put it back — don't send empty answer
+                                        self.pending_question = Some(pq);
+                                    }
+                                } else if submitted == "quit" || submitted == "exit" {
                                     self.exit = true;
                                 } else if submitted.starts_with('/') {
                                     self.handle_slash_command(&submitted);
                                     self.input.clear();
+                                    self.clear_autocomplete();
                                 } else if !submitted.is_empty() {
+                                    self.push_history_entry(submitted.clone());
                                     self.messages.push(MessageEntry::Divider);
-                                    self.messages
-                                        .push(MessageEntry::User(submitted.clone()));
+                                    self.messages.push(MessageEntry::User(submitted.clone()));
                                     let _ = self.tx_to_engine.send(submitted).await;
                                     self.input.clear();
+                                    self.reset_history_navigation();
+                                    self.clear_autocomplete();
+                                    self.user_scrolled = false;
+                                    self.waiting_for_response = true;
                                     self.auto_scroll();
                                 }
                             }
                             KeybindingAction::ChatCancel => {
                                 self.input.clear();
+                                self.reset_history_navigation();
+                                self.clear_autocomplete();
                             }
-                            KeybindingAction::HistoryPrevious | KeybindingAction::HistoryNext => {}
+                            KeybindingAction::AutocompleteAccept => {
+                                self.accept_autocomplete();
+                            }
+                            KeybindingAction::AutocompleteDismiss => {
+                                self.dismiss_autocomplete();
+                            }
+                            KeybindingAction::AutocompletePrevious => {
+                                self.autocomplete_previous();
+                            }
+                            KeybindingAction::AutocompleteNext => {
+                                self.autocomplete_next();
+                            }
+                            KeybindingAction::HistoryPrevious => {
+                                self.navigate_history_previous();
+                            }
+                            KeybindingAction::HistoryNext => {
+                                self.navigate_history_next();
+                            }
                             _ => {}
                         }
                     } else {
                         match key.code {
-                            KeyCode::Char(c) => self.input.push(c),
+                            KeyCode::Char(c) => {
+                                self.reset_history_navigation();
+                                self.input.push(c);
+                                self.mark_autocomplete_dirty();
+                            }
                             KeyCode::Backspace => {
+                                self.reset_history_navigation();
                                 self.input.pop();
+                                self.mark_autocomplete_dirty();
+                            }
+                            KeyCode::Up => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                            }
+                            KeyCode::Down => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                            }
+                            KeyCode::PageUp => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_add(10);
                             }
                             _ => {}
                         }
                     }
-                }
+                } // end Event::Key
+                    Event::Mouse(mouse) => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                self.user_scrolled = true;
+                                self.scroll_offset = self.scroll_offset.saturating_add(3);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                } // end match event
             } else {
                 self.frame_ticker = self.frame_ticker.wrapping_add(1);
             }
@@ -282,90 +518,483 @@ impl App {
     }
 
     fn auto_scroll(&mut self) {
-        let total_lines: usize = self
-            .messages
-            .iter()
-            .map(|m| self.entry_line_count(m))
-            .sum();
+        if self.user_scrolled {
+            return;
+        }
+        let total_lines: usize = self.messages.iter().map(|m| self.entry_line_count(m)).sum();
         let stream_lines = self
             .current_stream
             .as_ref()
-            .map(|s| s.lines().count().max(1) + 1)
+            .map(|s| self.wrapped_line_count(s, ASSISTANT_PREFIX.len()))
             .unwrap_or(0);
-        self.scroll_offset = (total_lines + stream_lines).saturating_sub(10) as u16;
+        let visible = self.conv_height as usize;
+        self.scroll_offset = (total_lines + stream_lines).saturating_sub(visible) as u32;
     }
 
+    /// Count visual lines for a message, accounting for soft wrapping.
     fn entry_line_count(&self, entry: &MessageEntry) -> usize {
+        let w = self.term_width.saturating_sub(2) as usize; // same padding as render
+        if w == 0 {
+            return 1;
+        }
         match entry {
-            MessageEntry::User(t) | MessageEntry::Assistant(t) | MessageEntry::Error(t) => {
-                t.lines().count().max(1)
-            }
-            MessageEntry::System(t) => t.lines().count().max(1),
+            MessageEntry::User(t) => self.wrapped_line_count(t, 2), // "> " prefix
+            MessageEntry::Assistant(t) => self.wrapped_line_count(t, ASSISTANT_PREFIX.len()),
+            MessageEntry::Error(t) => self.wrapped_line_count(t, ASSISTANT_PREFIX.len()),
+            MessageEntry::System(t) => self.wrapped_line_count(t, 0),
             MessageEntry::ToolUse { .. } => 1,
             MessageEntry::Divider => 1,
             MessageEntry::Permission { .. } => 2,
+            MessageEntry::Question { question, .. } => self.wrapped_line_count(question, 0),
         }
+    }
+
+    /// Count visual lines after soft wrapping, given a prefix width.
+    fn wrapped_line_count(&self, text: &str, prefix_len: usize) -> usize {
+        let w = self.term_width.saturating_sub(2) as usize;
+        if w == 0 {
+            return text.lines().count().max(1);
+        }
+        let mut count = 0usize;
+        for line in text.lines() {
+            let total_chars = prefix_len + line.len();
+            if total_chars == 0 {
+                count += 1;
+            } else {
+                count += total_chars.div_ceil(w);
+            }
+        }
+        count.max(1)
     }
 
     fn handle_slash_command(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
-        let command = parts.first().copied().unwrap_or("");
+        let command_name = parts
+            .first()
+            .copied()
+            .unwrap_or("")
+            .trim_start_matches('/');
+        let args = if parts.len() > 1 {
+            parts[1..].join(" ")
+        } else {
+            String::new()
+        };
 
-        match command {
-            "/help" => {
-                self.messages.push(MessageEntry::System(
-                    "  /help  - Show this help\n  /clear - Clear conversation\n  /cost  - Show token usage and cost\n  /exit  - Exit the agent".to_string(),
-                ));
-            }
-            "/clear" => {
-                self.messages.clear();
-                self.scroll_offset = 0;
-                self.messages
-                    .push(MessageEntry::System("  Conversation cleared.".to_string()));
-            }
-            "/cost" => {
-                if let Some(ref tracker) = self.cost_tracker {
-                    if let Ok(t) = tracker.lock() {
-                        self.messages
-                            .push(MessageEntry::System(format!("  {}", t.format_total_cost())));
+        // Special case: /help needs access to the registry for listing commands.
+        if command_name == "help" {
+            let commands = self.command_registry.list();
+            let help_text = crate::commands::help::build_help_text(&commands);
+            self.messages.push(MessageEntry::System(help_text));
+            self.auto_scroll();
+            return;
+        }
+
+        if let Some(command) = self.command_registry.find(command_name) {
+            let ctx = CommandContext {
+                cost_tracker: self.cost_tracker.clone(),
+                cwd: std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            };
+
+            match command.execute(&args, &ctx) {
+                Ok(result) => match result {
+                    CommandResult::Text(text) => {
+                        self.messages.push(MessageEntry::System(text));
                     }
-                } else {
-                    self.messages.push(MessageEntry::System(
-                        "  Cost tracking not available.".to_string(),
-                    ));
+                    CommandResult::Clear => {
+                        self.messages.clear();
+                        self.scroll_offset = 0;
+                        self.messages.push(MessageEntry::System(
+                            "  Conversation cleared.".to_string(),
+                        ));
+                    }
+                    CommandResult::Exit => {
+                        self.exit = true;
+                    }
+                    CommandResult::Silent => {}
+                    CommandResult::Prompt(_prompt_cmd) => {
+                        // TODO: send prompt_cmd.content to engine with allowed_tools filter
+                        self.messages.push(MessageEntry::System(
+                            "  Prompt commands not yet wired to engine.".to_string(),
+                        ));
+                    }
+                },
+                Err(e) => {
+                    self.messages
+                        .push(MessageEntry::Error(format!("  Command error: {}", e)));
                 }
             }
-            "/exit" | "/quit" => {
-                self.exit = true;
-            }
-            _ => {
-                self.messages.push(MessageEntry::System(format!(
-                    "  Unknown command: {}",
-                    command
-                )));
-            }
+        } else {
+            self.messages.push(MessageEntry::System(format!(
+                "  Unknown command: /{}",
+                command_name
+            )));
         }
         self.auto_scroll();
     }
 
+    fn push_history_entry(&mut self, submitted: String) {
+        let is_duplicate = self
+            .input_history
+            .last()
+            .map(|s| s == &submitted)
+            .unwrap_or(false);
+        if !is_duplicate {
+            self.input_history.push(submitted);
+        }
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
+    }
+
+    fn navigate_history_previous(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+
+        let next_cursor = match self.history_cursor {
+            Some(idx) => idx.saturating_sub(1),
+            None => {
+                self.history_draft = Some(self.input.clone());
+                self.input_history.len() - 1
+            }
+        };
+
+        self.history_cursor = Some(next_cursor);
+        self.input = self.input_history[next_cursor].clone();
+    }
+
+    fn navigate_history_next(&mut self) {
+        let Some(idx) = self.history_cursor else {
+            return;
+        };
+
+        if idx + 1 < self.input_history.len() {
+            let next_idx = idx + 1;
+            self.history_cursor = Some(next_idx);
+            self.input = self.input_history[next_idx].clone();
+        } else {
+            self.history_cursor = None;
+            self.input = self.history_draft.take().unwrap_or_default();
+        }
+    }
+
+    fn is_autocomplete_visible(&self) -> bool {
+        self.pending_permission.is_none()
+            && self.pending_question.is_none()
+            && !self.autocomplete_items.is_empty()
+    }
+
+    fn mark_autocomplete_dirty(&mut self) {
+        self.autocomplete_dirty = true;
+        if self
+            .autocomplete_dismissed_input
+            .as_ref()
+            .map(|s| s != &self.input)
+            .unwrap_or(false)
+        {
+            self.autocomplete_dismissed_input = None;
+        }
+    }
+
+    fn clear_autocomplete(&mut self) {
+        self.autocomplete_items.clear();
+        self.autocomplete_selected = 0;
+        self.autocomplete_dismissed_input = None;
+        self.autocomplete_dirty = false;
+    }
+
+    fn maybe_refresh_autocomplete(&mut self) {
+        if !self.autocomplete_dirty {
+            return;
+        }
+
+        if self.pending_permission.is_some() || self.pending_question.is_some() {
+            self.autocomplete_items.clear();
+            self.autocomplete_selected = 0;
+            self.autocomplete_dirty = false;
+            return;
+        }
+
+        if self
+            .autocomplete_dismissed_input
+            .as_ref()
+            .map(|s| s == &self.input)
+            .unwrap_or(false)
+        {
+            self.autocomplete_items.clear();
+            self.autocomplete_selected = 0;
+            self.autocomplete_dirty = false;
+            return;
+        }
+
+        let mut next_items = self.build_command_suggestions();
+        if next_items.is_empty() {
+            if let Some(query) = self.extract_file_query() {
+                let is_debounced = self
+                    .last_file_refresh
+                    .map(|t| t.elapsed() < FILE_SUGGEST_DEBOUNCE)
+                    .unwrap_or(false);
+                if is_debounced {
+                    return;
+                }
+                next_items = self.build_file_suggestions(&query);
+                self.last_file_refresh = Some(Instant::now());
+            }
+        }
+
+        self.autocomplete_items = next_items;
+        if self.autocomplete_selected >= self.autocomplete_items.len() {
+            self.autocomplete_selected = 0;
+        }
+        self.autocomplete_dirty = false;
+    }
+
+    fn build_command_suggestions(&self) -> Vec<AutocompleteItem> {
+        let token = self.input.split_whitespace().next().unwrap_or("");
+        if !token.starts_with('/') {
+            return Vec::new();
+        }
+
+        let needle = token.trim_start_matches('/').to_lowercase();
+        let mut seen = HashSet::new();
+        let mut scored: Vec<(usize, String)> = Vec::new();
+
+        for command in self.command_registry.list() {
+            let mut names = vec![command.name().to_string()];
+            names.extend(command.aliases().into_iter().map(|alias| alias.to_string()));
+            for name in names {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let lower = name.to_lowercase();
+                if needle.is_empty() || lower.contains(&needle) {
+                    let score = if lower.starts_with(&needle) { 0 } else { 1 };
+                    scored.push((score, name));
+                }
+            }
+        }
+
+        scored.sort_by(|a, b| a.cmp(b));
+        scored
+            .into_iter()
+            .take(AUTOCOMPLETE_MAX_ITEMS)
+            .map(|(_, name)| AutocompleteItem {
+                display: format!("/{}", name),
+                insert: format!("/{} ", name),
+                kind: AutocompleteKind::Command,
+            })
+            .collect()
+    }
+
+    fn extract_file_query(&self) -> Option<String> {
+        let token = self.input.split_whitespace().last()?;
+        if token.starts_with('@') {
+            Some(token.trim_start_matches('@').to_lowercase())
+        } else {
+            None
+        }
+    }
+
+    fn build_file_suggestions(&mut self, query: &str) -> Vec<AutocompleteItem> {
+        if self.file_index.is_none() {
+            self.file_index = Some(self.scan_workspace_files());
+        }
+
+        let files = self.file_index.clone().unwrap_or_default();
+        let mut scored: Vec<(usize, String)> = files
+            .into_iter()
+            .filter_map(|path| {
+                let lower = path.to_lowercase();
+                if query.is_empty() || lower.contains(query) {
+                    let score = if lower.starts_with(query) { 0 } else { 1 };
+                    Some((score, path))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        scored.sort_by(|a, b| a.cmp(b));
+        scored
+            .into_iter()
+            .take(AUTOCOMPLETE_MAX_ITEMS)
+            .map(|(_, path)| AutocompleteItem {
+                display: format!("@{}", path),
+                insert: format!("@{}", path),
+                kind: AutocompleteKind::File,
+            })
+            .collect()
+    }
+
+    fn scan_workspace_files(&self) -> Vec<String> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+            if out.len() >= FILE_SCAN_MAX {
+                return;
+            }
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+
+            for entry in entries.flatten() {
+                if out.len() >= FILE_SCAN_MAX {
+                    return;
+                }
+                let path = entry.path();
+                let name = entry.file_name();
+                if let Some(name_str) = name.to_str() {
+                    if matches!(name_str, ".git" | "target" | "node_modules") {
+                        continue;
+                    }
+                }
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if let Ok(rel) = path.strip_prefix(root) {
+                    out.push(rel.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out
+    }
+
+    fn accept_autocomplete(&mut self) {
+        if self.autocomplete_items.is_empty() {
+            return;
+        }
+
+        let idx = self
+            .autocomplete_selected
+            .min(self.autocomplete_items.len().saturating_sub(1));
+        let item = self.autocomplete_items[idx].clone();
+
+        match item.kind {
+            AutocompleteKind::Command => {
+                let mut parts = self.input.splitn(2, ' ');
+                let _ = parts.next();
+                if let Some(rest) = parts.next() {
+                    self.input = format!("{}{}", item.insert, rest.trim_start());
+                } else {
+                    self.input = item.insert;
+                }
+            }
+            AutocompleteKind::File => {
+                self.input = Self::replace_last_token(&self.input, &item.insert);
+            }
+        }
+
+        self.autocomplete_items.clear();
+        self.autocomplete_selected = 0;
+        self.autocomplete_dismissed_input = None;
+        self.autocomplete_dirty = true;
+    }
+
+    fn dismiss_autocomplete(&mut self) {
+        self.autocomplete_dismissed_input = Some(self.input.clone());
+        self.autocomplete_items.clear();
+        self.autocomplete_selected = 0;
+        self.autocomplete_dirty = false;
+    }
+
+    fn autocomplete_previous(&mut self) {
+        if self.autocomplete_items.is_empty() {
+            return;
+        }
+        if self.autocomplete_selected == 0 {
+            self.autocomplete_selected = self.autocomplete_items.len() - 1;
+        } else {
+            self.autocomplete_selected -= 1;
+        }
+    }
+
+    fn autocomplete_next(&mut self) {
+        if self.autocomplete_items.is_empty() {
+            return;
+        }
+        self.autocomplete_selected = (self.autocomplete_selected + 1) % self.autocomplete_items.len();
+    }
+
+    fn replace_last_token(input: &str, replacement: &str) -> String {
+        if let Some((idx, _)) = input.char_indices().rev().find(|(_, ch)| ch.is_whitespace()) {
+            let prefix = &input[..=idx];
+            format!("{}{}", prefix, replacement)
+        } else {
+            replacement.to_string()
+        }
+    }
+
     // ── Rendering ────────────────────────────────────────────────────────
 
-    fn ui(&self, f: &mut Frame) {
+    fn ui(&mut self, f: &mut Frame) {
         let area = f.size();
+        self.term_width = area.width;
 
-        // Layout: [conversation] [status line] [prompt]
+        let autocomplete_height = if self.is_autocomplete_visible() {
+            self.autocomplete_items.len().min(AUTOCOMPLETE_MAX_ITEMS) as u16
+        } else {
+            0
+        };
+
+        // Layout: [conversation] [status line] [autocomplete] [prompt]
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),    // conversation
                 Constraint::Length(1), // status line
+                Constraint::Length(autocomplete_height), // autocomplete
                 Constraint::Length(1), // prompt input
             ])
             .split(area);
 
+        self.conv_height = chunks[0].height;
         self.render_conversation(f, chunks[0]);
         self.render_status_line(f, chunks[1]);
-        self.render_prompt(f, chunks[2]);
+        if autocomplete_height > 0 {
+            self.render_autocomplete(f, chunks[2]);
+        }
+        self.render_prompt(f, chunks[3]);
+    }
+
+    fn render_autocomplete(&self, f: &mut Frame, area: Rect) {
+        let mut lines: Vec<Line> = Vec::new();
+        for (idx, item) in self
+            .autocomplete_items
+            .iter()
+            .take(AUTOCOMPLETE_MAX_ITEMS)
+            .enumerate()
+        {
+            let selected = idx == self.autocomplete_selected;
+            let marker = if selected { "▶" } else { "·" };
+            let kind = match item.kind {
+                AutocompleteKind::Command => "CMD",
+                AutocompleteKind::File => "FILE",
+            };
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::LightCyan)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let kind_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", marker), style),
+                Span::styled(format!("{} ", kind), kind_style),
+                Span::styled(item.display.clone(), style),
+            ]));
+        }
+
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
     }
 
     fn render_conversation(&self, f: &mut Frame, area: Rect) {
@@ -380,9 +1009,16 @@ impl App {
                         lines.push(Line::from(vec![
                             Span::styled(
                                 format!("{} ", PROMPT_CHAR),
-                                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(line.to_string(), Style::default().fg(Color::White)),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                         ]));
                     }
                 }
@@ -390,47 +1026,51 @@ impl App {
                     for (i, line) in text.lines().enumerate() {
                         let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
                         lines.push(Line::from(vec![
-                            Span::styled(prefix.to_string(), dim),
+                            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
                             Span::raw(line.to_string()),
                         ]));
                     }
                 }
                 MessageEntry::ToolUse { name, done, error } => {
-                    let (dot_style, name_style) = if *error {
-                        (
-                            Style::default().fg(Color::Red),
-                            Style::default().fg(Color::Red),
-                        )
+                    if *error {
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(DOT, Style::default().fg(Color::Red)),
+                            Span::raw(" "),
+                            Span::styled(name.clone(), Style::default().fg(Color::Red)),
+                        ]));
                     } else if *done {
-                        (
-                            Style::default().fg(Color::Green),
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-                        )
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(DOT, Style::default().fg(Color::Green)),
+                            Span::raw(" "),
+                            Span::styled(
+                                name.clone(),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
                     } else {
-                        // blinking dim dot for in-progress
-                        let vis = if self.frame_ticker % 10 < 5 {
-                            Style::default().fg(Color::DarkGray)
-                        } else {
-                            Style::default().fg(Color::Black)
-                        };
-                        (vis, Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
-                    };
-
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(DOT, dot_style),
-                        Span::raw(" "),
-                        Span::styled(name.clone(), name_style),
-                    ]));
+                        let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
+                        lines.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(spinner.to_string(), Style::default().fg(Color::LightCyan)),
+                            Span::raw(" "),
+                            Span::styled(
+                                name.clone(),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
                 }
                 MessageEntry::Error(text) => {
                     for line in text.lines() {
                         lines.push(Line::from(vec![
                             Span::styled(ASSISTANT_PREFIX.to_string(), dim),
-                            Span::styled(
-                                line.to_string(),
-                                Style::default().fg(Color::Red),
-                            ),
+                            Span::styled(line.to_string(), Style::default().fg(Color::Red)),
                         ]));
                     }
                 }
@@ -440,9 +1080,9 @@ impl App {
                     }
                 }
                 MessageEntry::Divider => {
-                    let divider: String =
-                        std::iter::repeat(DIVIDER_CHAR).take(w.min(80)).collect();
-                    lines.push(Line::from(Span::styled(divider, dim)));
+                    let divider_char = RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()];
+                    let divider: String = std::iter::repeat_n(divider_char, w.min(80)).collect();
+                    lines.push(Line::from(Span::styled(divider, Style::default().fg(Color::DarkGray))));
                 }
                 MessageEntry::Permission {
                     tool_name,
@@ -466,7 +1106,37 @@ impl App {
                         Style::default().fg(Color::Yellow),
                     )));
                 }
+                MessageEntry::Question { question, .. } => {
+                    for line in question.lines() {
+                        lines.push(Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::Cyan),
+                        )));
+                    }
+                }
             }
+        }
+
+        // Thinking spinner
+        if self.waiting_for_response {
+            let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
+            let thinking_dots = match self.frame_ticker % 3 {
+                0 => ".",
+                1 => "..",
+                _ => "...",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", spinner),
+                    Style::default().fg(Color::LightCyan),
+                ),
+                Span::styled(
+                    format!("Thinking{}", thinking_dots),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
         }
 
         // Streaming text
@@ -479,30 +1149,29 @@ impl App {
                         Span::raw(line.to_string()),
                     ]));
                 }
+            } else {
+                // Empty stream — push a blank streaming line for the cursor
+                lines.push(Line::from(vec![
+                    Span::styled(ASSISTANT_PREFIX.to_string(), dim),
+                ]));
             }
-            // Blinking cursor
+            // Blinking cursor — always on the last streaming line
             let cursor = if self.frame_ticker % 10 < 5 {
                 "\u{2588}" // full block
             } else {
                 " "
             };
-            let last_idx = lines.len().saturating_sub(1);
-            if let Some(last) = lines.get_mut(last_idx) {
+            if let Some(last) = lines.last_mut() {
                 last.spans.push(Span::styled(
                     cursor.to_string(),
                     Style::default().fg(Color::DarkGray),
                 ));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    cursor.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                )));
             }
         }
 
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .scroll((self.scroll_offset, 0));
+            .scroll((self.scroll_offset.min(u16::MAX as u32) as u16, 0));
 
         f.render_widget(para, area);
     }
@@ -511,14 +1180,17 @@ impl App {
         let dim = Style::default().fg(Color::DarkGray);
         let w = area.width as usize;
 
-        // Left: model/tool status
-        let left = if let Some(ref tool) = self.running_tool {
-            format!(" {} ...", tool)
+        let pulse = if self.frame_ticker % 8 < 4 { "●" } else { "◌" };
+        let left_body = if let Some(ref tool) = self.running_tool {
+            format!("{} {}", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()], tool)
         } else if self.current_stream.is_some() {
-            " streaming...".to_string()
+            format!("{} streaming", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()])
+        } else if self.waiting_for_response {
+            format!("{} thinking", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()])
         } else {
-            String::new()
+            "ready".to_string()
         };
+        let left = format!(" {} rust-agent | {} ", pulse, left_body);
 
         // Right: cost if available
         let right = if let Some(ref tracker) = self.cost_tracker {
@@ -536,12 +1208,13 @@ impl App {
         };
 
         let fill_len = w.saturating_sub(left.len() + right.len());
-        let fill: String = std::iter::repeat(DIVIDER_CHAR).take(fill_len).collect();
+        let rail_char = RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()];
+        let fill: String = std::iter::repeat_n(rail_char, fill_len).collect();
 
         let line = Line::from(vec![
-            Span::styled(left, dim),
+            Span::styled(left, Style::default().fg(Color::Cyan)),
             Span::styled(fill, dim),
-            Span::styled(right, dim),
+            Span::styled(right, Style::default().fg(Color::Green)),
         ]);
 
         f.render_widget(Paragraph::new(vec![line]), area);
@@ -560,6 +1233,18 @@ impl App {
                 ),
             ]);
             f.render_widget(Paragraph::new(vec![line]), area);
+        } else if self.pending_question.is_some() {
+            // Show user input with cyan prompt while answering a question
+            let cursor_vis = if self.frame_ticker % 10 < 5 { "\u{2588}" } else { " " };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{} ", PROMPT_CHAR),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(self.input.clone()),
+                Span::styled(cursor_vis.to_string(), Style::default().fg(Color::DarkGray)),
+            ]);
+            f.render_widget(Paragraph::new(vec![line]), area);
         } else {
             let cursor_vis = if self.frame_ticker % 10 < 5 {
                 "\u{2588}" // full block cursor
@@ -567,18 +1252,17 @@ impl App {
                 " "
             };
 
+            let prompt_glyph = if self.frame_ticker % 12 < 6 { "❯" } else { PROMPT_CHAR };
+
             let line = Line::from(vec![
                 Span::styled(
-                    format!("{} ", PROMPT_CHAR),
+                    format!("{} ", prompt_glyph),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(self.input.clone()),
-                Span::styled(
-                    cursor_vis.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(cursor_vis.to_string(), Style::default().fg(Color::DarkGray)),
             ]);
             f.render_widget(Paragraph::new(vec![line]), area);
         }

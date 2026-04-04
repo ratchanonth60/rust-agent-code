@@ -6,15 +6,20 @@
 //! - **Interactive** (default) — full ratatui TUI with streaming,
 //!   tool dots, permission prompts, and slash commands.
 
+pub mod commands;
+pub mod config;
+pub mod context;
 pub mod engine;
-pub mod models;
-pub mod tools;
-pub mod ui;
-pub mod mem;
 pub mod keybindings;
+pub mod mcp;
+pub mod mem;
+pub mod models;
 pub mod output_styles;
 pub mod permissions;
-pub mod context;
+pub mod plugins;
+pub mod skills;
+pub mod tools;
+pub mod ui;
 
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -72,7 +77,7 @@ struct Args {
 /// Returns the default model name for a given provider.
 fn default_model(provider: ModelProvider) -> &'static str {
     match provider {
-        ModelProvider::Gemini => "gemini-2.5-pro",
+        ModelProvider::Gemini => "gemini-2.5-flash",
         ModelProvider::OpenAI => "gpt-4o-mini",
         ModelProvider::Claude => "claude-sonnet-4-6",
         ModelProvider::OpenAICompatible => "gpt-4o-mini",
@@ -84,12 +89,32 @@ async fn main() -> anyhow::Result<()> {
     // Attempt to load .env file
     let _ = dotenvy::dotenv();
 
-    // Initialize tracing
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Setting default subscriber failed");
+    // In TUI mode ratatui owns the terminal; any write to stdout/stderr corrupts it.
+    // Redirect tracing to a log file instead.
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".rust-agent.log"),
+        )
+        .ok();
+    if let Some(file) = log_file {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(Level::INFO)
+            .with_writer(std::sync::Mutex::new(file))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("Setting default subscriber failed");
+    } else {
+        let subscriber = FmtSubscriber::builder()
+            .with_max_level(Level::WARN)
+            .with_writer(std::io::stderr)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("Setting default subscriber failed");
+    }
 
     let args = Args::parse();
 
@@ -113,17 +138,18 @@ async fn main() -> anyhow::Result<()> {
         permission_mode: args.permission_mode,
     };
 
-    let engine = QueryEngine::new(
-        selected_model,
-        args.provider,
-        args.api_key.clone(),
-        args.api_base.clone(),
-        config,
-    )?
-    .with_agent_tool();
-
+    // ── One-shot mode ────────────────────────────────────────────────────
     if let Some(q) = args.query {
-        // One-shot mode
+        let engine = QueryEngine::new(
+            selected_model,
+            args.provider,
+            args.api_key.clone(),
+            args.api_base.clone(),
+            config,
+            None, // no TUI channel in one-shot mode
+        )?
+        .with_agent_tool();
+
         info!("Received query: {}", q);
         let cost_tracker = engine.cost_tracker.clone();
         let result = engine.query(&q, None).await;
@@ -133,10 +159,20 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => eprintln!("Error: {:?}", e),
         }
 
-        // Print cost summary
         print_cost_summary(&cost_tracker);
+
+    // ── Bare mode ──────────────────────────────────────────────────────
     } else if args.bare {
-        // Bare mode: simple stdin/stdout loop, no TUI
+        let engine = QueryEngine::new(
+            selected_model,
+            args.provider,
+            args.api_key.clone(),
+            args.api_base.clone(),
+            config,
+            None, // no TUI channel in bare mode
+        )?
+        .with_agent_tool();
+
         info!("Running in bare mode.");
         let cost_tracker = engine.cost_tracker.clone();
         let engine = std::sync::Arc::new(engine);
@@ -169,12 +205,27 @@ async fn main() -> anyhow::Result<()> {
         }
 
         print_cost_summary(&cost_tracker);
+
+    // ── Interactive TUI mode ───────────────────────────────────────────
     } else {
-        // Interactive TUI mode
         info!("Starting interactive UI...");
 
-        // Setup channels for UI <-> Engine
+        // Channel: user questions from AskUserQuestionTool → TUI
+        let (question_tx, question_rx) = mpsc::channel::<crate::tools::ask_user::QuestionRequest>(8);
+
+        let engine = QueryEngine::new(
+            selected_model,
+            args.provider,
+            args.api_key.clone(),
+            args.api_base.clone(),
+            config,
+            Some(question_tx),
+        )?
+        .with_agent_tool();
+
+        // Channel: user input → engine background task
         let (tx_to_engine, mut rx_to_engine) = mpsc::channel::<String>(32);
+        // Channel: engine events → TUI
         let (tx_to_ui, rx_to_ui) = mpsc::channel::<ui::app::UiEvent>(32);
 
         let cost_tracker = engine.cost_tracker.clone();
@@ -187,15 +238,20 @@ async fn main() -> anyhow::Result<()> {
                         let _ = tx_to_ui.send(ui::app::UiEvent::LLMResponse(response)).await;
                     }
                     Err(e) => {
-                        let _ = tx_to_ui.send(ui::app::UiEvent::LLMError(e.to_string())).await;
+                        let _ = tx_to_ui
+                            .send(ui::app::UiEvent::LLMError(e.to_string()))
+                            .await;
                     }
                 }
             }
         });
 
+        // Build the slash command registry
+        let command_registry = commands::build_default_registry();
+
         // Enter interactive Ratatui mode
         let mut terminal = ui::setup_terminal()?;
-        let mut app = ui::app::App::new(tx_to_engine, rx_to_ui);
+        let mut app = ui::app::App::new(tx_to_engine, rx_to_ui, question_rx, command_registry);
         app.cost_tracker = Some(cost_tracker.clone());
 
         let app_result = app.run(&mut terminal).await;
@@ -214,7 +270,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Prints the session cost summary to stderr (if any cost was incurred).
-fn print_cost_summary(cost_tracker: &std::sync::Arc<std::sync::Mutex<crate::engine::cost_tracker::CostTracker>>) {
+fn print_cost_summary(
+    cost_tracker: &std::sync::Arc<std::sync::Mutex<crate::engine::cost_tracker::CostTracker>>,
+) {
     if let Ok(tracker) = cost_tracker.lock() {
         if tracker.total_cost_usd > 0.0 {
             eprintln!("\n{}", tracker.format_total_cost());

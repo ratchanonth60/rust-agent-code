@@ -61,7 +61,7 @@ impl Tool for GlobTool {
 
         let start = Instant::now();
 
-        let full_pattern = if search_path == PathBuf::from(".") || search_path == std::env::current_dir().unwrap_or_default() {
+        let full_pattern = if search_path == std::path::Path::new(".") || search_path == std::env::current_dir().unwrap_or_default() {
             pattern.to_string()
         } else {
             format!("{}/{}", search_path.display(), pattern)

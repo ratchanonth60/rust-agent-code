@@ -4,20 +4,33 @@
 //! `Vec<Box<dyn Tool + Send + Sync>>` and dispatches calls by matching the
 //! LLM's `function.name` against [`Tool::name`].
 
+pub mod ask_user;
 pub mod bash;
+pub mod config_tool;
 pub mod edit;
 pub mod fs;
 pub mod glob_tool;
 pub mod grep_tool;
-pub mod todo;
+pub mod notebook;
+pub mod plan_mode;
+pub mod registry;
+pub mod skill_tool;
 pub mod sleep;
+pub mod tasks;
+pub mod teams;
+pub mod todo;
 pub mod web_fetch;
-pub mod ask_user;
+pub mod web_search;
+pub mod worktree;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::models::Message;
+use crate::permissions::PermissionMode;
+
+// ── Context and Result types ─────────────────────────────────────────────
 
 /// Runtime context passed to every [`Tool::call`] invocation.
 ///
@@ -33,6 +46,14 @@ pub struct ToolContext {
     pub max_budget_usd: Option<f64>,
     /// When `true`, tools skip interactive confirmation prompts.
     pub auto_mode: bool,
+    /// Working directory for file-relative operations.
+    pub cwd: PathBuf,
+    /// Current permission mode — tools may adapt behavior accordingly.
+    pub permission_mode: PermissionMode,
+    /// Active session ID (if session persistence is enabled).
+    pub session_id: Option<String>,
+    /// `true` when running inside a sub-agent spawned by [`AgentTool`].
+    pub is_agent: bool,
 }
 
 /// The outcome of a single [`Tool::call`] execution.

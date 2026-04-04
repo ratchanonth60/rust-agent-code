@@ -90,9 +90,9 @@ impl CostTracker {
 
         for (model, usage) in &self.model_usage {
             use fmt::Write;
-            let _ = write!(
+            let _ = writeln!(
                 result,
-                "{:>21}:  {} input, {} output, {} cache read, {} cache write (${:.4})\n",
+                "{:>21}:  {} input, {} output, {} cache read, {} cache write (${:.4})",
                 model,
                 usage.input_tokens,
                 usage.output_tokens,

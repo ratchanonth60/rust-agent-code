@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use regex::Regex;
+
 use crate::permissions::path_safety::{is_dangerous_path, is_within_directory};
 use crate::permissions::types::*;
 use crate::tools::Tool;
@@ -87,7 +89,7 @@ pub fn check_permission(
     // 6. AcceptEdits + within working dir → allow writes
     if mode == PermissionMode::AcceptEdits {
         let file_path = extract_file_path(tool_name, input);
-        let in_cwd = file_path.as_deref().map_or(false, |p| is_within_directory(p, cwd));
+        let in_cwd = file_path.as_deref().is_some_and(|p| is_within_directory(p, cwd));
         if in_cwd {
             return PermissionDecision::Allow;
         }
@@ -121,15 +123,40 @@ pub fn check_permission(
 /// Extract a file path from tool input if applicable.
 fn extract_file_path(tool_name: &str, input: &Value) -> Option<String> {
     match tool_name {
-        "Write" | "Edit" | "Read" => {
+        "write_file" | "Write" | "Edit" | "read_file" | "Read" => {
             input.get("file_path").and_then(|v| v.as_str()).map(String::from)
         }
-        "Bash" => {
-            // Try to detect file paths in bash commands (best-effort)
-            None
+        "Bash" | "bash" => {
+            // Best-effort extraction of target paths from destructive shell commands.
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            extract_bash_target_path(cmd)
         }
         _ => None,
     }
+}
+
+/// Best-effort regex extraction of file paths from shell commands.
+///
+/// Matches destructive commands (`rm`, `mv`, `cp`, `chmod`, `chown`) and
+/// redirect operators (`>`, `>>`) followed by an absolute or relative path.
+fn extract_bash_target_path(cmd: &str) -> Option<String> {
+    // Pattern: destructive command followed by flags then a path
+    let destructive_re = Regex::new(
+        r"(?:^|\s|;|&&|\|\|)\s*(?:sudo\s+)?(?:rm|mv|cp|chmod|chown)\s+(?:-\S+\s+)*([/~][\w./_-]+|\.[\w./_-]+)"
+    ).ok()?;
+    if let Some(caps) = destructive_re.captures(cmd) {
+        return caps.get(1).map(|m| m.as_str().to_string());
+    }
+
+    // Pattern: redirect operators writing to a file
+    let redirect_re = Regex::new(
+        r">{1,2}\s*([/~][\w./_-]+|\.[\w./_-]+)"
+    ).ok()?;
+    if let Some(caps) = redirect_re.captures(cmd) {
+        return caps.get(1).map(|m| m.as_str().to_string());
+    }
+
+    None
 }
 
 /// Apply DontAsk transformation: convert Ask → Deny.
@@ -141,5 +168,59 @@ pub fn apply_mode_transform(decision: PermissionDecision, mode: PermissionMode) 
             }
         }
         _ => decision,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_bash_path_rm() {
+        let result = extract_bash_target_path("rm -rf /etc/passwd");
+        assert_eq!(result, Some("/etc/passwd".to_string()));
+    }
+
+    #[test]
+    fn extract_bash_path_sudo_rm() {
+        let result = extract_bash_target_path("sudo rm -rf /var/log/syslog");
+        assert_eq!(result, Some("/var/log/syslog".to_string()));
+    }
+
+    #[test]
+    fn extract_bash_path_redirect() {
+        let result = extract_bash_target_path("echo secret > ~/.ssh/authorized_keys");
+        assert_eq!(result, Some("~/.ssh/authorized_keys".to_string()));
+    }
+
+    #[test]
+    fn extract_bash_path_redirect_append() {
+        let result = extract_bash_target_path("cat data >> /tmp/output.log");
+        assert_eq!(result, Some("/tmp/output.log".to_string()));
+    }
+
+    #[test]
+    fn extract_bash_path_safe_command() {
+        let result = extract_bash_target_path("ls /tmp");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn extract_bash_path_chained() {
+        let result = extract_bash_target_path("echo hi && rm /etc/passwd");
+        assert_eq!(result, Some("/etc/passwd".to_string()));
+    }
+
+    #[test]
+    fn extract_file_path_for_write_tool() {
+        let input = json!({"file_path": "/home/user/test.rs", "content": "fn main() {}"});
+        assert_eq!(extract_file_path("Write", &input), Some("/home/user/test.rs".to_string()));
+    }
+
+    #[test]
+    fn extract_file_path_for_bash_tool() {
+        let input = json!({"command": "rm -rf /dangerous/path"});
+        assert_eq!(extract_file_path("Bash", &input), Some("/dangerous/path".to_string()));
     }
 }
