@@ -24,10 +24,10 @@ use crate::tools::ask_user::QuestionRequest;
 
 // ── Claude Code style characters ─────────────────────────────────────────
 const ASSISTANT_PREFIX: &str = "  \u{23BF} "; // ⎿ (left square bracket extension)
-const DIVIDER_CHAR: char = '\u{2500}'; // ─ (box-drawing horizontal)
 const DOT: &str = "\u{25CF}"; // ● (filled circle)
 const PROMPT_CHAR: &str = ">";
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const RAIL_FRAMES: &[char] = &['─', '╌', '┄', '╌'];
 const AUTOCOMPLETE_MAX_ITEMS: usize = 5;
 const FILE_SCAN_MAX: usize = 5000;
 const FILE_SUGGEST_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -969,18 +969,27 @@ impl App {
             .enumerate()
         {
             let selected = idx == self.autocomplete_selected;
-            let marker = if selected { "▶" } else { " " };
+            let marker = if selected { "▶" } else { "·" };
             let kind = match item.kind {
-                AutocompleteKind::Command => "cmd",
-                AutocompleteKind::File => "file",
+                AutocompleteKind::Command => "CMD",
+                AutocompleteKind::File => "FILE",
             };
             let style = if selected {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                Style::default().fg(Color::Black).bg(Color::LightCyan)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::Gray)
+            };
+            let kind_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{} {} ", marker, kind), style),
+                Span::styled(format!("{} ", marker), style),
+                Span::styled(format!("{} ", kind), kind_style),
                 Span::styled(item.display.clone(), style),
             ]));
         }
@@ -1001,10 +1010,15 @@ impl App {
                             Span::styled(
                                 format!("{} ", PROMPT_CHAR),
                                 Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default()
                                     .fg(Color::White)
                                     .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(line.to_string(), Style::default().fg(Color::White)),
                         ]));
                     }
                 }
@@ -1012,7 +1026,7 @@ impl App {
                     for (i, line) in text.lines().enumerate() {
                         let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
                         lines.push(Line::from(vec![
-                            Span::styled(prefix.to_string(), dim),
+                            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
                             Span::raw(line.to_string()),
                         ]));
                     }
@@ -1041,7 +1055,7 @@ impl App {
                         let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
                         lines.push(Line::from(vec![
                             Span::raw("  "),
-                            Span::styled(spinner.to_string(), Style::default().fg(Color::Cyan)),
+                            Span::styled(spinner.to_string(), Style::default().fg(Color::LightCyan)),
                             Span::raw(" "),
                             Span::styled(
                                 name.clone(),
@@ -1066,8 +1080,9 @@ impl App {
                     }
                 }
                 MessageEntry::Divider => {
-                    let divider: String = std::iter::repeat_n(DIVIDER_CHAR, w.min(80)).collect();
-                    lines.push(Line::from(Span::styled(divider, dim)));
+                    let divider_char = RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()];
+                    let divider: String = std::iter::repeat_n(divider_char, w.min(80)).collect();
+                    lines.push(Line::from(Span::styled(divider, Style::default().fg(Color::DarkGray))));
                 }
                 MessageEntry::Permission {
                     tool_name,
@@ -1105,13 +1120,18 @@ impl App {
         // Thinking spinner
         if self.waiting_for_response {
             let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
+            let thinking_dots = match self.frame_ticker % 3 {
+                0 => ".",
+                1 => "..",
+                _ => "...",
+            };
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {} ", spinner),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(Color::LightCyan),
                 ),
                 Span::styled(
-                    "Thinking...",
+                    format!("Thinking{}", thinking_dots),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),
@@ -1160,17 +1180,17 @@ impl App {
         let dim = Style::default().fg(Color::DarkGray);
         let w = area.width as usize;
 
-        // Left: model/tool status
-        let left = if let Some(ref tool) = self.running_tool {
-            format!(" {} ...", tool)
+        let pulse = if self.frame_ticker % 8 < 4 { "●" } else { "◌" };
+        let left_body = if let Some(ref tool) = self.running_tool {
+            format!("{} {}", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()], tool)
         } else if self.current_stream.is_some() {
-            " streaming...".to_string()
+            format!("{} streaming", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()])
         } else if self.waiting_for_response {
-            let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
-            format!(" {} thinking...", spinner)
+            format!("{} thinking", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()])
         } else {
-            String::new()
+            "ready".to_string()
         };
+        let left = format!(" {} rust-agent | {} ", pulse, left_body);
 
         // Right: cost if available
         let right = if let Some(ref tracker) = self.cost_tracker {
@@ -1188,12 +1208,13 @@ impl App {
         };
 
         let fill_len = w.saturating_sub(left.len() + right.len());
-        let fill: String = std::iter::repeat_n(DIVIDER_CHAR, fill_len).collect();
+        let rail_char = RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()];
+        let fill: String = std::iter::repeat_n(rail_char, fill_len).collect();
 
         let line = Line::from(vec![
-            Span::styled(left, dim),
+            Span::styled(left, Style::default().fg(Color::Cyan)),
             Span::styled(fill, dim),
-            Span::styled(right, dim),
+            Span::styled(right, Style::default().fg(Color::Green)),
         ]);
 
         f.render_widget(Paragraph::new(vec![line]), area);
@@ -1231,11 +1252,13 @@ impl App {
                 " "
             };
 
+            let prompt_glyph = if self.frame_ticker % 12 < 6 { "❯" } else { PROMPT_CHAR };
+
             let line = Line::from(vec![
                 Span::styled(
-                    format!("{} ", PROMPT_CHAR),
+                    format!("{} ", prompt_glyph),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(self.input.clone()),
