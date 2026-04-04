@@ -175,4 +175,51 @@ mod tests {
         session.append_message(serde_json::json!({"role": "user", "content": "hello"}));
         assert_eq!(session.messages.len(), 1);
     }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let id = format!("test-roundtrip-{}", std::process::id());
+        let mut session = Session::new(
+            id.clone(),
+            "test-model".to_string(),
+            "Claude".to_string(),
+        );
+        session.append_message(serde_json::json!({"role": "user", "content": "hello"}));
+        session.append_message(serde_json::json!({"role": "assistant", "content": "hi there"}));
+        session.summary = Some("test round-trip".to_string());
+
+        // Save
+        session.save().expect("save should succeed");
+
+        // Load
+        let loaded = Session::load(&id).expect("load should succeed");
+        assert_eq!(loaded.id, id);
+        assert_eq!(loaded.model, "test-model");
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.summary.as_deref(), Some("test round-trip"));
+
+        // Cleanup
+        let path = sessions_dir().join(format!("{}.json", id));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn list_sessions_includes_saved() {
+        let id = format!("test-list-{}", std::process::id());
+        let mut session = Session::new(
+            id.clone(),
+            "list-model".to_string(),
+            "Gemini".to_string(),
+        );
+        session.append_message(serde_json::json!({"role": "user", "content": "test"}));
+        session.save().expect("save should succeed");
+
+        let summaries = Session::list_sessions().expect("list should succeed");
+        let found = summaries.iter().any(|s| s.id == id);
+        assert!(found, "saved session should appear in list");
+
+        // Cleanup
+        let path = sessions_dir().join(format!("{}.json", id));
+        let _ = fs::remove_file(path);
+    }
 }

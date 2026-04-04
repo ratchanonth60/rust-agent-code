@@ -75,12 +75,54 @@ impl Command for ResumeCommand {
                         ))),
                         1 => {
                             let s = &matched[0];
-                            Ok(CommandResult::Text(format!(
-                                "  Session '{}' found ({} messages, model: {}).\n  \
-                                 Session resume is not yet fully wired — this is a placeholder.\n  \
-                                 Use `Session::load(\"{}\")` in the engine to restore it.",
-                                s.id, s.message_count, s.model, s.id
-                            )))
+                            match crate::engine::session::Session::load(&s.id) {
+                                Ok(session) => {
+                                    let summary = session.summary.as_deref().unwrap_or("(no summary)");
+                                    let mut lines = Vec::new();
+                                    lines.push(format!("  Resuming session: {}", session.id));
+                                    lines.push(format!("  Model: {}  |  Provider: {}", session.model, session.provider));
+                                    lines.push(format!("  Messages: {}  |  CWD: {}", session.messages.len(), session.cwd));
+                                    lines.push(format!("  Summary: {}", summary));
+                                    lines.push(String::new());
+
+                                    // Show last few conversation turns for context
+                                    let recent: Vec<_> = session.messages.iter().rev().take(6).collect();
+                                    if !recent.is_empty() {
+                                        lines.push("  Recent conversation:".to_string());
+                                        lines.push("  ───────────────────".to_string());
+                                        for msg in recent.iter().rev() {
+                                            let role = msg["role"].as_str().unwrap_or("?");
+                                            let content = msg.get("content")
+                                                .and_then(|c| {
+                                                    if let Some(s) = c.as_str() {
+                                                        Some(s.to_string())
+                                                    } else if let Some(arr) = c.as_array() {
+                                                        // Claude format: array of content blocks
+                                                        let texts: Vec<String> = arr.iter()
+                                                            .filter_map(|b| b["text"].as_str().map(String::from))
+                                                            .collect();
+                                                        if texts.is_empty() { None } else { Some(texts.join(" ")) }
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .unwrap_or_else(|| "(tool use)".to_string());
+                                            let truncated = if content.len() > 120 {
+                                                format!("{}...", &content[..120])
+                                            } else {
+                                                content
+                                            };
+                                            lines.push(format!("    [{}] {}", role, truncated));
+                                        }
+                                    }
+
+                                    Ok(CommandResult::Text(lines.join("\n")))
+                                }
+                                Err(e) => Ok(CommandResult::Text(format!(
+                                    "  Failed to load session '{}': {}",
+                                    s.id, e
+                                ))),
+                            }
                         }
                         _ => {
                             let ids: Vec<&str> = matched.iter().map(|s| s.id.as_str()).collect();
