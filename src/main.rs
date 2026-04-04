@@ -6,6 +6,8 @@
 //! - **Interactive** (default) — full ratatui TUI with streaming,
 //!   tool dots, permission prompts, and slash commands.
 
+pub mod commands;
+pub mod config;
 pub mod context;
 pub mod engine;
 pub mod keybindings;
@@ -133,17 +135,18 @@ async fn main() -> anyhow::Result<()> {
         permission_mode: args.permission_mode,
     };
 
-    let engine = QueryEngine::new(
-        selected_model,
-        args.provider,
-        args.api_key.clone(),
-        args.api_base.clone(),
-        config,
-    )?
-    .with_agent_tool();
-
+    // ── One-shot mode ────────────────────────────────────────────────────
     if let Some(q) = args.query {
-        // One-shot mode
+        let engine = QueryEngine::new(
+            selected_model,
+            args.provider,
+            args.api_key.clone(),
+            args.api_base.clone(),
+            config,
+            None, // no TUI channel in one-shot mode
+        )?
+        .with_agent_tool();
+
         info!("Received query: {}", q);
         let cost_tracker = engine.cost_tracker.clone();
         let result = engine.query(&q, None).await;
@@ -153,10 +156,20 @@ async fn main() -> anyhow::Result<()> {
             Err(e) => eprintln!("Error: {:?}", e),
         }
 
-        // Print cost summary
         print_cost_summary(&cost_tracker);
+
+    // ── Bare mode ──────────────────────────────────────────────────────
     } else if args.bare {
-        // Bare mode: simple stdin/stdout loop, no TUI
+        let engine = QueryEngine::new(
+            selected_model,
+            args.provider,
+            args.api_key.clone(),
+            args.api_base.clone(),
+            config,
+            None, // no TUI channel in bare mode
+        )?
+        .with_agent_tool();
+
         info!("Running in bare mode.");
         let cost_tracker = engine.cost_tracker.clone();
         let engine = std::sync::Arc::new(engine);
@@ -189,12 +202,27 @@ async fn main() -> anyhow::Result<()> {
         }
 
         print_cost_summary(&cost_tracker);
+
+    // ── Interactive TUI mode ───────────────────────────────────────────
     } else {
-        // Interactive TUI mode
         info!("Starting interactive UI...");
 
-        // Setup channels for UI <-> Engine
+        // Channel: user questions from AskUserQuestionTool → TUI
+        let (question_tx, question_rx) = mpsc::channel::<crate::tools::ask_user::QuestionRequest>(8);
+
+        let engine = QueryEngine::new(
+            selected_model,
+            args.provider,
+            args.api_key.clone(),
+            args.api_base.clone(),
+            config,
+            Some(question_tx),
+        )?
+        .with_agent_tool();
+
+        // Channel: user input → engine background task
         let (tx_to_engine, mut rx_to_engine) = mpsc::channel::<String>(32);
+        // Channel: engine events → TUI
         let (tx_to_ui, rx_to_ui) = mpsc::channel::<ui::app::UiEvent>(32);
 
         let cost_tracker = engine.cost_tracker.clone();
@@ -215,9 +243,12 @@ async fn main() -> anyhow::Result<()> {
             }
         });
 
+        // Build the slash command registry
+        let command_registry = commands::build_default_registry();
+
         // Enter interactive Ratatui mode
         let mut terminal = ui::setup_terminal()?;
-        let mut app = ui::app::App::new(tx_to_engine, rx_to_ui);
+        let mut app = ui::app::App::new(tx_to_engine, rx_to_ui, question_rx, command_registry);
         app.cost_tracker = Some(cost_tracker.clone());
 
         let app_result = app.run(&mut terminal).await;

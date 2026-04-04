@@ -263,4 +263,4 @@ Remaining (Phase 7):
 
 ## License
 
-Private -- not yet licensed for distribution.
+MIT

@@ -29,13 +29,7 @@ use tracing::info;
 use crate::engine::config::EngineConfig;
 use crate::engine::cost_tracker::CostTracker;
 use crate::permissions::{PermissionDecision, PermissionRule, check_permission};
-use crate::tools::{
-    fs::ReadFileTool, fs::WriteFileTool, bash::BashTool,
-    edit::FileEditTool, glob_tool::GlobTool, grep_tool::GrepTool,
-    todo::TodoWriteTool, sleep::SleepTool, web_fetch::WebFetchTool,
-    ask_user::AskUserQuestionTool,
-    Tool, ToolContext,
-};
+use crate::tools::{Tool, ToolContext};
 
 /// LLM provider selection.
 ///
@@ -71,12 +65,17 @@ pub struct QueryEngine {
 
 impl QueryEngine {
     /// Create a new QueryEngine specifying the provider and optional API overrides.
+    ///
+    /// `question_tx` is an optional channel sender for forwarding
+    /// [`AskUserQuestionTool`] questions to the TUI.  Pass `None` in
+    /// headless / bare mode.
     pub fn new(
         model: impl Into<String>,
         provider: ModelProvider,
         api_key: Option<String>,
         api_base: Option<String>,
         config: EngineConfig,
+        question_tx: Option<crate::tools::ask_user::QuestionSender>,
     ) -> Result<Self> {
         let openai_client = match provider {
             // Claude and Gemini have their own HTTP paths; no async_openai client needed.
@@ -127,19 +126,7 @@ impl QueryEngine {
         };
 
         let todo_list = crate::tools::todo::new_shared_todo_list();
-
-        let tools: Vec<Box<dyn Tool + Send + Sync>> = vec![
-            Box::new(ReadFileTool),
-            Box::new(WriteFileTool),
-            Box::new(BashTool),
-            Box::new(FileEditTool),
-            Box::new(GlobTool),
-            Box::new(GrepTool),
-            Box::new(TodoWriteTool { todos: todo_list.clone() }),
-            Box::new(SleepTool),
-            Box::new(WebFetchTool),
-            Box::new(AskUserQuestionTool::new(None)), // TUI channel wired later if needed
-        ];
+        let tools = crate::tools::registry::default_tools(todo_list.clone(), question_tx);
 
         Ok(Self {
             provider,
@@ -316,6 +303,10 @@ impl QueryEngine {
             debug: self.config.debug,
             tools_available: tool_names,
             max_budget_usd: self.config.max_budget_usd,
+            cwd: self.cwd.clone(),
+            permission_mode: self.config.permission_mode,
+            session_id: None,
+            is_agent: false,
         };
 
         // Pre-compute context window for compaction

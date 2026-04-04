@@ -78,7 +78,7 @@ impl Tool for AgentTool {
         sub_config.auto_mode = true; // sub-agents run non-interactively
 
         let sub_engine =
-            QueryEngine::new(self.model.clone(), self.provider, None, None, sub_config)?;
+            QueryEngine::new(self.model.clone(), self.provider, None, None, sub_config, None)?;
 
         match sub_engine.query(&prompt, None).await {
             Ok(result) => Ok(ToolResult::ok(json!({"result": result}))),

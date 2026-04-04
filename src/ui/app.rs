@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::commands::{CommandContext, CommandRegistry, CommandResult};
+use crate::tools::ask_user::QuestionRequest;
+
 // ── Claude Code style characters ─────────────────────────────────────────
 const ASSISTANT_PREFIX: &str = "  \u{23BF} "; // ⎿ (left square bracket extension)
 const DIVIDER_CHAR: char = '\u{2500}'; // ─ (box-drawing horizontal)
@@ -84,6 +87,12 @@ enum MessageEntry {
         tool_name: String,
         description: String,
     },
+    /// Interactive question from AskUserQuestionTool
+    Question {
+        question: String,
+        #[allow(dead_code)]
+        options: Vec<String>,
+    },
 }
 
 pub struct App {
@@ -95,6 +104,8 @@ pub struct App {
     pub current_stream: Option<String>,
     tx_to_engine: mpsc::Sender<String>,
     rx_from_engine: mpsc::Receiver<UiEvent>,
+    /// Receiver for interactive questions from AskUserQuestionTool.
+    rx_questions: mpsc::Receiver<QuestionRequest>,
     bindings: Vec<crate::keybindings::ParsedBinding>,
     scroll_offset: u32,
     /// Set when streaming is active to suppress the duplicate LLMResponse.
@@ -103,6 +114,8 @@ pub struct App {
     /// a new message is submitted.
     user_scrolled: bool,
     pending_permission: Option<PendingPermission>,
+    /// Pending question from AskUserQuestionTool awaiting user input.
+    pending_question: Option<PendingQuestion>,
     pub cost_tracker: Option<Arc<Mutex<crate::engine::cost_tracker::CostTracker>>>,
     /// Terminal width for divider rendering.
     term_width: u16,
@@ -110,6 +123,14 @@ pub struct App {
     conv_height: u16,
     /// True after user submits a query until the first response event arrives.
     waiting_for_response: bool,
+    /// Submitted chat inputs (newest at the end) for up/down recall.
+    input_history: Vec<String>,
+    /// Cursor into `input_history` while browsing; `None` means not browsing.
+    history_cursor: Option<usize>,
+    /// Draft input captured before entering history navigation.
+    history_draft: Option<String>,
+    /// Registry of slash commands.
+    command_registry: CommandRegistry,
 }
 
 struct PendingPermission {
@@ -119,10 +140,17 @@ struct PendingPermission {
     response_tx: oneshot::Sender<PermissionResponse>,
 }
 
+/// A question from `AskUserQuestionTool` waiting for the user's typed answer.
+struct PendingQuestion {
+    response_tx: oneshot::Sender<String>,
+}
+
 impl App {
     pub fn new(
         tx_to_engine: mpsc::Sender<String>,
         rx_from_engine: mpsc::Receiver<UiEvent>,
+        rx_questions: mpsc::Receiver<QuestionRequest>,
+        command_registry: CommandRegistry,
     ) -> Self {
         let load_result = crate::keybindings::load_keybindings();
         if !load_result.warnings.is_empty() {
@@ -137,15 +165,21 @@ impl App {
             current_stream: None,
             tx_to_engine,
             rx_from_engine,
+            rx_questions,
             bindings: load_result.bindings,
             scroll_offset: 0,
             streamed_this_turn: false,
             user_scrolled: false,
             pending_permission: None,
+            pending_question: None,
             cost_tracker: None,
             term_width: 80,
             conv_height: 24,
             waiting_for_response: false,
+            input_history: Vec::new(),
+            history_cursor: None,
+            history_draft: None,
+            command_registry,
         }
     }
 
@@ -239,10 +273,51 @@ impl App {
                 }
             }
 
+            // Poll for incoming questions from AskUserQuestionTool
+            while let Ok(qreq) = self.rx_questions.try_recv() {
+                let mut question_text = format!("  ? {}", qreq.question);
+                if !qreq.options.is_empty() {
+                    for (i, opt) in qreq.options.iter().enumerate() {
+                        question_text.push_str(&format!("\n    {}. {}", i + 1, opt));
+                    }
+                }
+                self.messages.push(MessageEntry::Question {
+                    question: question_text,
+                    options: qreq.options,
+                });
+                self.pending_question = Some(PendingQuestion {
+                    response_tx: qreq.response_tx,
+                });
+                self.auto_scroll();
+            }
+
             if event::poll(Duration::from_millis(50))? {
                 self.frame_ticker = self.frame_ticker.wrapping_add(1);
                 match event::read()? {
                     Event::Key(key) => {
+                    // Question prompt intercept — send typed answer back to AskUserQuestionTool
+                    if self.pending_question.is_some() {
+                        if let KeyCode::Enter = key.code {
+                            let answer = self.input.trim().to_string();
+                            if !answer.is_empty() {
+                                let q = self.pending_question.take().unwrap();
+                                self.messages.push(MessageEntry::System(format!(
+                                    "  → {}", answer
+                                )));
+                                let _ = q.response_tx.send(answer);
+                                self.input.clear();
+                                self.auto_scroll();
+                            }
+                            continue;
+                        }
+                        match key.code {
+                            KeyCode::Char(c) => self.input.push(c),
+                            KeyCode::Backspace => { self.input.pop(); }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Permission prompt intercept
                     if self.pending_permission.is_some() {
                         let response = match key.code {
@@ -286,16 +361,30 @@ impl App {
                             KeybindingAction::AppRedraw => {}
                             KeybindingAction::ChatSubmit => {
                                 let submitted = self.input.trim().to_string();
-                                if submitted == "quit" || submitted == "exit" {
+                                // If there's a pending question, the user's input
+                                // is the answer — send it back to the tool.
+                                if let Some(pq) = self.pending_question.take() {
+                                    if !submitted.is_empty() {
+                                        self.messages.push(MessageEntry::User(submitted.clone()));
+                                        let _ = pq.response_tx.send(submitted);
+                                        self.input.clear();
+                                        self.auto_scroll();
+                                    } else {
+                                        // Put it back — don't send empty answer
+                                        self.pending_question = Some(pq);
+                                    }
+                                } else if submitted == "quit" || submitted == "exit" {
                                     self.exit = true;
                                 } else if submitted.starts_with('/') {
                                     self.handle_slash_command(&submitted);
                                     self.input.clear();
                                 } else if !submitted.is_empty() {
+                                    self.push_history_entry(submitted.clone());
                                     self.messages.push(MessageEntry::Divider);
                                     self.messages.push(MessageEntry::User(submitted.clone()));
                                     let _ = self.tx_to_engine.send(submitted).await;
                                     self.input.clear();
+                                    self.reset_history_navigation();
                                     self.user_scrolled = false;
                                     self.waiting_for_response = true;
                                     self.auto_scroll();
@@ -303,14 +392,24 @@ impl App {
                             }
                             KeybindingAction::ChatCancel => {
                                 self.input.clear();
+                                self.reset_history_navigation();
                             }
-                            KeybindingAction::HistoryPrevious | KeybindingAction::HistoryNext => {}
+                            KeybindingAction::HistoryPrevious => {
+                                self.navigate_history_previous();
+                            }
+                            KeybindingAction::HistoryNext => {
+                                self.navigate_history_next();
+                            }
                             _ => {}
                         }
                     } else {
                         match key.code {
-                            KeyCode::Char(c) => self.input.push(c),
+                            KeyCode::Char(c) => {
+                                self.reset_history_navigation();
+                                self.input.push(c)
+                            }
                             KeyCode::Backspace => {
+                                self.reset_history_navigation();
                                 self.input.pop();
                             }
                             KeyCode::Up => {
@@ -383,6 +482,7 @@ impl App {
             MessageEntry::ToolUse { .. } => 1,
             MessageEntry::Divider => 1,
             MessageEntry::Permission { .. } => 2,
+            MessageEntry::Question { question, .. } => self.wrapped_line_count(question, 0),
         }
     }
 
@@ -406,43 +506,116 @@ impl App {
 
     fn handle_slash_command(&mut self, cmd: &str) {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
-        let command = parts.first().copied().unwrap_or("");
+        let command_name = parts
+            .first()
+            .copied()
+            .unwrap_or("")
+            .trim_start_matches('/');
+        let args = if parts.len() > 1 {
+            parts[1..].join(" ")
+        } else {
+            String::new()
+        };
 
-        match command {
-            "/help" => {
-                self.messages.push(MessageEntry::System(
-                    "  /help  - Show this help\n  /clear - Clear conversation\n  /cost  - Show token usage and cost\n  /exit  - Exit the agent".to_string(),
-                ));
-            }
-            "/clear" => {
-                self.messages.clear();
-                self.scroll_offset = 0;
-                self.messages
-                    .push(MessageEntry::System("  Conversation cleared.".to_string()));
-            }
-            "/cost" => {
-                if let Some(ref tracker) = self.cost_tracker {
-                    if let Ok(t) = tracker.lock() {
-                        self.messages
-                            .push(MessageEntry::System(format!("  {}", t.format_total_cost())));
+        // Special case: /help needs access to the registry for listing commands.
+        if command_name == "help" {
+            let commands = self.command_registry.list();
+            let help_text = crate::commands::help::build_help_text(&commands);
+            self.messages.push(MessageEntry::System(help_text));
+            self.auto_scroll();
+            return;
+        }
+
+        if let Some(command) = self.command_registry.find(command_name) {
+            let ctx = CommandContext {
+                cost_tracker: self.cost_tracker.clone(),
+                cwd: std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            };
+
+            match command.execute(&args, &ctx) {
+                Ok(result) => match result {
+                    CommandResult::Text(text) => {
+                        self.messages.push(MessageEntry::System(text));
                     }
-                } else {
-                    self.messages.push(MessageEntry::System(
-                        "  Cost tracking not available.".to_string(),
-                    ));
+                    CommandResult::Clear => {
+                        self.messages.clear();
+                        self.scroll_offset = 0;
+                        self.messages.push(MessageEntry::System(
+                            "  Conversation cleared.".to_string(),
+                        ));
+                    }
+                    CommandResult::Exit => {
+                        self.exit = true;
+                    }
+                    CommandResult::Silent => {}
+                    CommandResult::Prompt(_prompt_cmd) => {
+                        // TODO: send prompt_cmd.content to engine with allowed_tools filter
+                        self.messages.push(MessageEntry::System(
+                            "  Prompt commands not yet wired to engine.".to_string(),
+                        ));
+                    }
+                },
+                Err(e) => {
+                    self.messages
+                        .push(MessageEntry::Error(format!("  Command error: {}", e)));
                 }
             }
-            "/exit" | "/quit" => {
-                self.exit = true;
-            }
-            _ => {
-                self.messages.push(MessageEntry::System(format!(
-                    "  Unknown command: {}",
-                    command
-                )));
-            }
+        } else {
+            self.messages.push(MessageEntry::System(format!(
+                "  Unknown command: /{}",
+                command_name
+            )));
         }
         self.auto_scroll();
+    }
+
+    fn push_history_entry(&mut self, submitted: String) {
+        let is_duplicate = self
+            .input_history
+            .last()
+            .map(|s| s == &submitted)
+            .unwrap_or(false);
+        if !is_duplicate {
+            self.input_history.push(submitted);
+        }
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.history_cursor = None;
+        self.history_draft = None;
+    }
+
+    fn navigate_history_previous(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+
+        let next_cursor = match self.history_cursor {
+            Some(idx) => idx.saturating_sub(1),
+            None => {
+                self.history_draft = Some(self.input.clone());
+                self.input_history.len() - 1
+            }
+        };
+
+        self.history_cursor = Some(next_cursor);
+        self.input = self.input_history[next_cursor].clone();
+    }
+
+    fn navigate_history_next(&mut self) {
+        let Some(idx) = self.history_cursor else {
+            return;
+        };
+
+        if idx + 1 < self.input_history.len() {
+            let next_idx = idx + 1;
+            self.history_cursor = Some(next_idx);
+            self.input = self.input_history[next_idx].clone();
+        } else {
+            self.history_cursor = None;
+            self.input = self.history_draft.take().unwrap_or_default();
+        }
     }
 
     // ── Rendering ────────────────────────────────────────────────────────
@@ -570,6 +743,14 @@ impl App {
                         Style::default().fg(Color::Yellow),
                     )));
                 }
+                MessageEntry::Question { question, .. } => {
+                    for line in question.lines() {
+                        lines.push(Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::Cyan),
+                        )));
+                    }
+                }
             }
         }
 
@@ -681,6 +862,18 @@ impl App {
                     "Allow? (y)es / (n)o / (a)lways",
                     Style::default().fg(Color::Yellow),
                 ),
+            ]);
+            f.render_widget(Paragraph::new(vec![line]), area);
+        } else if self.pending_question.is_some() {
+            // Show user input with cyan prompt while answering a question
+            let cursor_vis = if self.frame_ticker % 10 < 5 { "\u{2588}" } else { " " };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{} ", PROMPT_CHAR),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(self.input.clone()),
+                Span::styled(cursor_vis.to_string(), Style::default().fg(Color::DarkGray)),
             ]);
             f.render_widget(Paragraph::new(vec![line]), area);
         } else {
