@@ -16,6 +16,7 @@ pub mod mem;
 pub mod models;
 pub mod output_styles;
 pub mod permissions;
+pub mod plugins;
 pub mod skills;
 pub mod tools;
 pub mod ui;
