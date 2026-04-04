@@ -20,6 +20,7 @@ pub mod export;
 pub mod fast;
 pub mod help;
 pub mod keybindings_cmd;
+pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod output_style;
@@ -78,6 +79,9 @@ pub fn build_default_registry() -> CommandRegistry {
     reg.register(Box::new(compact::CompactCommand));
     reg.register(Box::new(export::ExportCommand));
     reg.register(Box::new(resume::ResumeCommand));
+
+    // MCP
+    reg.register(Box::new(mcp::McpCommand));
 
     reg
 }
