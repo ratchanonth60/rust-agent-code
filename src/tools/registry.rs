@@ -5,6 +5,7 @@
 
 use crate::tools::ask_user::{AskUserQuestionTool, QuestionSender};
 use crate::tools::bash::BashTool;
+use crate::tools::config_tool::ConfigTool;
 use crate::tools::edit::FileEditTool;
 use crate::tools::fs::{ReadFileTool, WriteFileTool};
 use crate::tools::glob_tool::GlobTool;
@@ -15,6 +16,8 @@ use crate::tools::sleep::SleepTool;
 use crate::tools::tasks::{self, BackgroundTaskTool, TaskOutputTool, TaskStopTool};
 use crate::tools::todo::{SharedTodoList, TodoWriteTool};
 use crate::tools::web_fetch::WebFetchTool;
+use crate::tools::web_search::WebSearchTool;
+use crate::tools::worktree::{self, EnterWorktreeTool, ExitWorktreeTool};
 use crate::tools::Tool;
 
 /// Returns the standard set of built-in tools.
@@ -25,6 +28,7 @@ pub fn default_tools(
     question_tx: Option<QuestionSender>,
 ) -> Vec<Box<dyn Tool + Send + Sync>> {
     let task_manager = tasks::new_shared_task_manager();
+    let worktree_state = worktree::new_shared_worktree_state();
 
     vec![
         // File operations
@@ -52,8 +56,18 @@ pub fn default_tools(
         Box::new(TodoWriteTool { todos: todo_list }),
         Box::new(EnterPlanModeTool),
         Box::new(ExitPlanModeTool),
-        // Communication
+        // Worktree
+        Box::new(EnterWorktreeTool {
+            state: worktree_state.clone(),
+        }),
+        Box::new(ExitWorktreeTool {
+            state: worktree_state,
+        }),
+        // Communication & web
         Box::new(WebFetchTool),
+        Box::new(WebSearchTool),
         Box::new(AskUserQuestionTool::new(question_tx)),
+        // Configuration
+        Box::new(ConfigTool),
     ]
 }
