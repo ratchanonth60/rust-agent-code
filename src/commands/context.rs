@@ -34,8 +34,7 @@ impl Command for ContextCommand {
             Some(ctx.cwd.join(".claude").join("CLAUDE.md")),
         ];
 
-        for path_opt in &claudemd_paths {
-            if let Some(path) = path_opt {
+        for path in claudemd_paths.iter().flatten() {
                 if path.exists() {
                     let size = std::fs::metadata(path)
                         .map(|m| m.len())
@@ -44,7 +43,6 @@ impl Command for ContextCommand {
                 } else {
                     lines.push(format!("    [absent] {}", path.display()));
                 }
-            }
         }
 
         // Git context

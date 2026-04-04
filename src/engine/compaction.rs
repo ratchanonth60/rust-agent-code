@@ -50,7 +50,7 @@ pub fn microcompact(messages: &mut [Value], keep_recent: usize) {
             let large = block
                 .get("content")
                 .and_then(Value::as_str)
-                .map_or(false, |c| c.len() > CLEAR_THRESHOLD);
+                .is_some_and(|c| c.len() > CLEAR_THRESHOLD);
             if large {
                 if let Some(obj) = block.as_object_mut() {
                     obj.insert("content".into(), Value::String(CLEARED_MARKER.into()));
@@ -78,7 +78,7 @@ pub fn microcompact_openai(messages: &mut [Value], keep_recent: usize) {
         let large = msg
             .get("content")
             .and_then(Value::as_str)
-            .map_or(false, |c| c.len() > CLEAR_THRESHOLD);
+            .is_some_and(|c| c.len() > CLEAR_THRESHOLD);
         if large {
             if let Some(obj) = msg.as_object_mut() {
                 obj.insert("content".into(), Value::String(CLEARED_MARKER.into()));

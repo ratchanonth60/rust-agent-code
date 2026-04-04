@@ -174,8 +174,7 @@ pub async fn parse_claude_sse(
 
                 "content_block_start" => {
                     if let Some(block) = &sse_data.content_block {
-                        match block.r#type.as_str() {
-                            "tool_use" => {
+                        if block.r#type.as_str() == "tool_use" {
                                 let id = block.id.clone().unwrap_or_default();
                                 let name = block.name.clone().unwrap_or_default();
                                 let index = sse_data.index.unwrap_or(0);
@@ -187,8 +186,6 @@ pub async fn parse_claude_sse(
                                 if let Some(tx) = tx {
                                     let _ = tx.send(StreamEvent::ToolUseStart { index, id, name }).await;
                                 }
-                            }
-                            _ => {} // text blocks start empty
                         }
                     }
                 }

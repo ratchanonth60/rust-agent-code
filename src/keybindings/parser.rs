@@ -80,7 +80,7 @@ pub fn parse_chord(input: &str) -> Chord {
     }
     input
         .split_whitespace()
-        .map(|s| parse_keystroke(s))
+        .map(parse_keystroke)
         .collect()
 }
 
@@ -237,8 +237,7 @@ pub fn parse_bindings(blocks: &[KeybindingBlock]) -> Vec<ParsedBinding> {
 /// assert_eq!(normalize_key_for_comparison("ctrl+x ctrl+b"), "ctrl+x ctrl+b");
 /// ```
 pub fn normalize_key_for_comparison(key: &str) -> String {
-    key.trim()
-        .split_whitespace()
+    key.split_whitespace()
         .map(normalize_step)
         .collect::<Vec<_>>()
         .join(" ")

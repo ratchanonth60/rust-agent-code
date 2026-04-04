@@ -89,7 +89,7 @@ pub fn check_permission(
     // 6. AcceptEdits + within working dir → allow writes
     if mode == PermissionMode::AcceptEdits {
         let file_path = extract_file_path(tool_name, input);
-        let in_cwd = file_path.as_deref().map_or(false, |p| is_within_directory(p, cwd));
+        let in_cwd = file_path.as_deref().is_some_and(|p| is_within_directory(p, cwd));
         if in_cwd {
             return PermissionDecision::Allow;
         }

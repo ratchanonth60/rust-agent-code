@@ -21,17 +21,12 @@ pub fn config_path() -> PathBuf {
 // ── Editor mode ──────────────────────────────────────────────────────
 
 /// Editor input mode for the TUI prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EditorMode {
+    #[default]
     Normal,
     Vim,
-}
-
-impl Default for EditorMode {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 impl std::fmt::Display for EditorMode {
