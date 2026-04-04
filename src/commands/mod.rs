@@ -35,6 +35,7 @@ pub mod commit;
 pub mod compact;
 pub mod review;
 pub mod resume;
+pub mod skill;
 pub mod theme;
 
 pub use registry::CommandRegistry;
@@ -82,6 +83,9 @@ pub fn build_default_registry() -> CommandRegistry {
 
     // MCP
     reg.register(Box::new(mcp::McpCommand));
+
+    // Skills
+    reg.register(Box::new(skill::SkillCommand));
 
     reg
 }

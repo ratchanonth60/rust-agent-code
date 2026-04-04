@@ -718,7 +718,7 @@ impl App {
                     }
                 }
                 MessageEntry::Divider => {
-                    let divider: String = std::iter::repeat(DIVIDER_CHAR).take(w.min(80)).collect();
+                    let divider: String = std::iter::repeat_n(DIVIDER_CHAR, w.min(80)).collect();
                     lines.push(Line::from(Span::styled(divider, dim)));
                 }
                 MessageEntry::Permission {
@@ -840,7 +840,7 @@ impl App {
         };
 
         let fill_len = w.saturating_sub(left.len() + right.len());
-        let fill: String = std::iter::repeat(DIVIDER_CHAR).take(fill_len).collect();
+        let fill: String = std::iter::repeat_n(DIVIDER_CHAR, fill_len).collect();
 
         let line = Line::from(vec![
             Span::styled(left, dim),

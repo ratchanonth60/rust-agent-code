@@ -14,6 +14,7 @@ pub mod grep_tool;
 pub mod notebook;
 pub mod plan_mode;
 pub mod registry;
+pub mod skill_tool;
 pub mod sleep;
 pub mod tasks;
 pub mod todo;

@@ -11,10 +11,12 @@ pub mod config;
 pub mod context;
 pub mod engine;
 pub mod keybindings;
+pub mod mcp;
 pub mod mem;
 pub mod models;
 pub mod output_styles;
 pub mod permissions;
+pub mod skills;
 pub mod tools;
 pub mod ui;
 
