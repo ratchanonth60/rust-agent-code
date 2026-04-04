@@ -28,6 +28,8 @@ const DOT: &str = "\u{25CF}"; // ● (filled circle)
 const PROMPT_CHAR: &str = ">";
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const RAIL_FRAMES: &[char] = &['─', '╌', '┄', '╌'];
+const HERO_TITLE: &str = "RUST AGENT";
+const HERO_TAGLINE: &str = "AI coding companion for your terminal";
 const AUTOCOMPLETE_MAX_ITEMS: usize = 5;
 const FILE_SCAN_MAX: usize = 5000;
 const FILE_SUGGEST_DEBOUNCE: Duration = Duration::from_millis(50);
@@ -244,6 +246,10 @@ impl App {
                     UiEvent::ToolStarted(name) => {
                         self.waiting_for_response = false;
                         self.running_tool = Some(name.clone());
+                        self.messages.push(MessageEntry::System(format!(
+                            "  ↳ starting tool: {}",
+                            name
+                        )));
                         self.messages.push(MessageEntry::ToolUse {
                             name,
                             done: false,
@@ -267,6 +273,11 @@ impl App {
                                 }
                             }
                         }
+                        self.messages.push(MessageEntry::System(format!(
+                            "  ✓ finished tool: {}",
+                            name
+                        )));
+                        self.auto_scroll();
                     }
                     UiEvent::StreamStart => {
                         self.waiting_for_response = false;
@@ -1002,11 +1013,43 @@ impl App {
         let dim = Style::default().fg(Color::DarkGray);
         let mut lines: Vec<Line> = Vec::new();
 
+        if self.scroll_offset == 0 {
+            let reveal = (self.frame_ticker / 2).min(HERO_TAGLINE.chars().count());
+            let tagline: String = HERO_TAGLINE.chars().take(reveal).collect();
+            let hero_rule: String = std::iter::repeat_n(
+                RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()],
+                w.min(56),
+            )
+            .collect();
+            lines.push(Line::from(vec![
+                Span::styled("  ✦ ", Style::default().fg(Color::LightCyan)),
+                Span::styled(
+                    HERO_TITLE,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", dim),
+                Span::styled(hero_rule, dim),
+            ]));
+            if !tagline.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("    ", dim),
+                    Span::styled(
+                        tagline,
+                        Style::default()
+                            .fg(Color::Gray)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(Span::raw("")));
+        }
+
         for entry in &self.messages {
             match entry {
                 MessageEntry::User(text) => {
                     for line in text.lines() {
                         lines.push(Line::from(vec![
+                            Span::styled("│ ", Style::default().fg(Color::Cyan)),
                             Span::styled(
                                 format!("{} ", PROMPT_CHAR),
                                 Style::default()
@@ -1026,6 +1069,7 @@ impl App {
                     for (i, line) in text.lines().enumerate() {
                         let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
                         lines.push(Line::from(vec![
+                            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
                             Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
                             Span::raw(line.to_string()),
                         ]));
@@ -1069,6 +1113,7 @@ impl App {
                 MessageEntry::Error(text) => {
                     for line in text.lines() {
                         lines.push(Line::from(vec![
+                            Span::styled("│ ", Style::default().fg(Color::Red)),
                             Span::styled(ASSISTANT_PREFIX.to_string(), dim),
                             Span::styled(line.to_string(), Style::default().fg(Color::Red)),
                         ]));
