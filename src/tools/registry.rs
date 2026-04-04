@@ -15,6 +15,7 @@ use crate::tools::plan_mode::{EnterPlanModeTool, ExitPlanModeTool};
 use crate::tools::skill_tool::SkillTool;
 use crate::tools::sleep::SleepTool;
 use crate::tools::tasks::{self, BackgroundTaskTool, TaskOutputTool, TaskStopTool};
+use crate::tools::teams::{CreateTeamTool, DeleteTeamTool, SendTeamMessageTool};
 use crate::tools::todo::{SharedTodoList, TodoWriteTool};
 use crate::tools::web_fetch::WebFetchTool;
 use crate::tools::web_search::WebSearchTool;
@@ -72,5 +73,9 @@ pub fn default_tools(
         Box::new(ConfigTool),
         // Skills
         Box::new(SkillTool),
+        // Team collaboration
+        Box::new(CreateTeamTool),
+        Box::new(DeleteTeamTool),
+        Box::new(SendTeamMessageTool),
     ]
 }
