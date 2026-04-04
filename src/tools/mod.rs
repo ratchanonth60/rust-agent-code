@@ -6,6 +6,7 @@
 
 pub mod ask_user;
 pub mod bash;
+pub mod config_tool;
 pub mod edit;
 pub mod fs;
 pub mod glob_tool;
@@ -17,6 +18,8 @@ pub mod sleep;
 pub mod tasks;
 pub mod todo;
 pub mod web_fetch;
+pub mod web_search;
+pub mod worktree;
 
 use async_trait::async_trait;
 use serde_json::Value;
