@@ -167,17 +167,9 @@ impl App {
                     }
                 }
                 MessageEntry::Assistant(text) => {
-                    for (i, line) in text.lines().enumerate() {
-                        let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
-                        lines.push(Line::from(vec![
-                            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(
-                                prefix.to_string(),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            Span::raw(line.to_string()),
-                        ]));
-                    }
+                    let md_lines = crate::ui::markdown::render_markdown(text, w);
+                    let guttered = prepend_assistant_gutter(md_lines);
+                    lines.extend(guttered);
                 }
                 MessageEntry::ToolUse { name, done, error } => {
                     if *error {
@@ -288,19 +280,18 @@ impl App {
             ]));
         }
 
-        // Streaming text
+        // Streaming text (markdown-rendered)
         if let Some(ref stream) = self.current_stream {
             if !stream.is_empty() {
-                for (i, line) in stream.lines().enumerate() {
-                    let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix.to_string(), dim),
-                        Span::raw(line.to_string()),
-                    ]));
-                }
+                let md_lines = crate::ui::markdown::render_markdown(stream, w);
+                let guttered = prepend_assistant_gutter(md_lines);
+                lines.extend(guttered);
             } else {
                 // Empty stream — push a blank streaming line for the cursor
-                lines.push(Line::from(vec![Span::styled(ASSISTANT_PREFIX.to_string(), dim)]));
+                lines.push(Line::from(vec![
+                    Span::styled("│ ".to_string(), dim),
+                    Span::styled(ASSISTANT_PREFIX.to_string(), dim),
+                ]));
             }
             // Blinking cursor — always on the last streaming line
             let cursor = if self.frame_ticker % 10 < 5 {
@@ -452,4 +443,24 @@ impl App {
             f.render_widget(Paragraph::new(vec![line]), area);
         }
     }
+}
+
+/// Prepend the assistant gutter and prefix spans to markdown-rendered lines.
+///
+/// First line: `"│ "` + `"  ⎿ "`, subsequent lines: `"│ "` + `"    "`.
+fn prepend_assistant_gutter(md_lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    md_lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
+            let mut spans = vec![
+                Span::styled("│ ".to_string(), dim),
+                Span::styled(prefix.to_string(), dim),
+            ];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
 }

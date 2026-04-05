@@ -614,7 +614,7 @@ impl App {
         let stream_lines = self
             .current_stream
             .as_ref()
-            .map(|s| self.wrapped_line_count(s, ASSISTANT_PREFIX.len()))
+            .map(|s| self.md_line_count(s))
             .unwrap_or(0);
         let visible = self.conv_height as usize;
         self.scroll_offset = (total_lines + stream_lines).saturating_sub(visible) as u32;
@@ -636,7 +636,7 @@ impl App {
         }
         match entry {
             MessageEntry::User(t) => self.wrapped_line_count(t, 2), // "> " prefix
-            MessageEntry::Assistant(t) => self.wrapped_line_count(t, ASSISTANT_PREFIX.len()),
+            MessageEntry::Assistant(t) => self.md_line_count(t),
             MessageEntry::Error(t) => self.wrapped_line_count(t, ASSISTANT_PREFIX.len()),
             MessageEntry::System(t) => self.wrapped_line_count(t, 0),
             MessageEntry::ToolUse { .. } => 1,
@@ -668,6 +668,27 @@ impl App {
                 count += 1;
             } else {
                 count += total_chars.div_ceil(w);
+            }
+        }
+        count.max(1)
+    }
+
+    /// Estimate rendered line count for markdown-rendered assistant text.
+    fn md_line_count(&self, text: &str) -> usize {
+        let w = self.term_width.saturating_sub(2) as usize;
+        if w == 0 {
+            return text.lines().count().max(1);
+        }
+        let md_lines = crate::ui::markdown::render_markdown(text, w);
+        let gutter_prefix_len = 2 + ASSISTANT_PREFIX.len(); // "│ " + prefix
+        let usable = w.saturating_sub(gutter_prefix_len).max(1);
+        let mut count = 0usize;
+        for line in &md_lines {
+            let char_count: usize = line.spans.iter().map(|s| s.content.len()).sum();
+            if char_count == 0 {
+                count += 1;
+            } else {
+                count += char_count.div_ceil(usable);
             }
         }
         count.max(1)
