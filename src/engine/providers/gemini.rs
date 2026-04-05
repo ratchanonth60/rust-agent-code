@@ -30,17 +30,23 @@ use crate::engine::query::QueryEngine;
 use crate::tools::ToolContext;
 
 impl QueryEngine {
-    /// Resolves the Gemini API key from environment variables.
+    /// Resolves the Gemini API key, preferring resolved engine configuration
+    /// over environment variables.
     pub(crate) fn get_gemini_key(&self) -> String {
-        std::env::var("GEMINI_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
-            .unwrap_or_default()
+        self.api_key.clone().unwrap_or_else(|| {
+            std::env::var("GEMINI_API_KEY")
+                .or_else(|_| std::env::var("LLM_API_KEY"))
+                .unwrap_or_default()
+        })
     }
 
-    /// Returns the Gemini OpenAI-compat chat completions endpoint.
+    /// Returns the Gemini OpenAI-compat chat completions endpoint, preferring
+    /// resolved engine configuration over environment variables.
     pub(crate) fn get_gemini_endpoint(&self) -> String {
-        let base = std::env::var("GEMINI_API_BASE")
-            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        let base = self.api_base.clone().unwrap_or_else(|| {
+            std::env::var("GEMINI_API_BASE")
+                .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string())
+        });
         format!("{}/v1beta/openai/chat/completions", base.trim_end_matches('/'))
     }
 
