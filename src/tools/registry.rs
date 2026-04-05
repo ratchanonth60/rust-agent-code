@@ -1,8 +1,10 @@
 //! Tool registry — centralises tool construction for the engine.
 //!
 //! Instead of inline `vec![…]` in [`QueryEngine::new`], the registry provides
-//! [`default_tools`] (always-on) and [`optional_tools`] (feature-gated).
+//! [`default_tools`] which returns both the tool vector and the shared task
+//! registry used by background task tools.
 
+use crate::tasks::SharedTaskRegistry;
 use crate::tools::ask_user::{AskUserQuestionTool, QuestionSender};
 use crate::tools::bash::BashTool;
 use crate::tools::config_tool::ConfigTool;
@@ -14,7 +16,7 @@ use crate::tools::notebook::NotebookEditTool;
 use crate::tools::plan_mode::{EnterPlanModeTool, ExitPlanModeTool};
 use crate::tools::skill_tool::SkillTool;
 use crate::tools::sleep::SleepTool;
-use crate::tools::tasks::{self, BackgroundTaskTool, TaskOutputTool, TaskStopTool};
+use crate::tools::tasks::{BackgroundTaskTool, TaskOutputTool, TaskStopTool};
 use crate::tools::teams::{CreateTeamTool, DeleteTeamTool, SendTeamMessageTool};
 use crate::tools::todo::{SharedTodoList, TodoWriteTool};
 use crate::tools::web_fetch::WebFetchTool;
@@ -22,17 +24,18 @@ use crate::tools::web_search::WebSearchTool;
 use crate::tools::worktree::{self, EnterWorktreeTool, ExitWorktreeTool};
 use crate::tools::Tool;
 
-/// Returns the standard set of built-in tools.
+/// Returns the standard set of built-in tools and the shared task registry.
 ///
-/// These tools are always available regardless of configuration.
+/// The returned [`SharedTaskRegistry`] should be stored in [`QueryEngine`]
+/// and passed to the TUI for status pill rendering and agent task tracking.
 pub fn default_tools(
     todo_list: SharedTodoList,
     question_tx: Option<QuestionSender>,
-) -> Vec<Box<dyn Tool + Send + Sync>> {
-    let task_manager = tasks::new_shared_task_manager();
+) -> (Vec<Box<dyn Tool + Send + Sync>>, SharedTaskRegistry) {
+    let task_registry = crate::tasks::new_shared_registry();
     let worktree_state = worktree::new_shared_worktree_state();
 
-    vec![
+    let tools: Vec<Box<dyn Tool + Send + Sync>> = vec![
         // File operations
         Box::new(ReadFileTool),
         Box::new(WriteFileTool),
@@ -46,13 +49,13 @@ pub fn default_tools(
         Box::new(SleepTool),
         // Task management
         Box::new(BackgroundTaskTool {
-            manager: task_manager.clone(),
+            registry: task_registry.clone(),
         }),
         Box::new(TaskOutputTool {
-            manager: task_manager.clone(),
+            registry: task_registry.clone(),
         }),
         Box::new(TaskStopTool {
-            manager: task_manager,
+            registry: task_registry.clone(),
         }),
         // Workflow
         Box::new(TodoWriteTool { todos: todo_list }),
@@ -77,5 +80,7 @@ pub fn default_tools(
         Box::new(CreateTeamTool),
         Box::new(DeleteTeamTool),
         Box::new(SendTeamMessageTool),
-    ]
+    ];
+
+    (tools, task_registry)
 }

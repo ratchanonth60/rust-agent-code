@@ -3,6 +3,8 @@
 //! Converts source code into styled [`ratatui::text::Line`] values
 //! with colors derived from a [`syntect`] theme.
 
+use std::sync::LazyLock;
+
 use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
@@ -12,13 +14,18 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+/// Cached syntax definitions — loaded once on first use.
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+/// Cached highlight themes — loaded once on first use.
+static THEME_SET: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
 /// Highlight a code string and return styled ratatui `Line`s.
 ///
 /// Falls back to plain (green) rendering if the language is unrecognised
 /// or if syntect encounters an error.
 pub fn highlight_code(code: &str, language: &str) -> Vec<Line<'static>> {
-    let ss = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
+    let ss = &*SYNTAX_SET;
+    let ts = &*THEME_SET;
     let theme = ts.themes.get("base16-ocean.dark").unwrap_or_else(|| {
         ts.themes.values().next().expect("No default themes")
     });
@@ -31,7 +38,7 @@ pub fn highlight_code(code: &str, language: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     for line in LinesWithEndings::from(code) {
-        match h.highlight_line(line, &ss) {
+        match h.highlight_line(line, ss) {
             Ok(ranges) => {
                 let spans: Vec<Span<'static>> = ranges
                     .iter()

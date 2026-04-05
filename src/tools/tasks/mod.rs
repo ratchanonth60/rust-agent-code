@@ -5,30 +5,20 @@
 //! - [`TaskOutputTool`] — read stdout/stderr from a running or completed task
 //! - [`TaskStopTool`] — terminate a running background task
 //!
-//! Tasks are tracked in a [`TaskManager`] wrapped in `Arc<Mutex<..>>`.
-
-pub mod manager;
+//! All tools operate on the unified [`TaskRegistry`](crate::tasks::TaskRegistry)
+//! via [`SharedTaskRegistry`](crate::tasks::SharedTaskRegistry).
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
 
+use crate::tasks::SharedTaskRegistry;
 use crate::tools::{Tool, ToolContext, ToolResult};
-use manager::{TaskManager, TaskStatus};
-
-/// Thread-safe shared reference to the task manager.
-pub type SharedTaskManager = Arc<Mutex<TaskManager>>;
-
-/// Create a new shared task manager.
-pub fn new_shared_task_manager() -> SharedTaskManager {
-    Arc::new(Mutex::new(TaskManager::new()))
-}
 
 // ── BackgroundTaskTool ──────────────────────────────────────────────────
 
 /// Spawn a shell command as a background task.
 pub struct BackgroundTaskTool {
-    pub manager: SharedTaskManager,
+    pub registry: SharedTaskRegistry,
 }
 
 #[async_trait]
@@ -68,13 +58,7 @@ impl Tool for BackgroundTaskTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
         let description = input["description"].as_str().unwrap_or("");
 
-        let task_id = {
-            let mut mgr = self
-                .manager
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Task manager lock error: {}", e))?;
-            mgr.spawn(command, description)?
-        };
+        let task_id = crate::tasks::shell::spawn(&self.registry, command, description, None)?;
 
         Ok(ToolResult::ok(json!({
             "task_id": task_id,
@@ -88,7 +72,7 @@ impl Tool for BackgroundTaskTool {
 
 /// Retrieve output from a background task.
 pub struct TaskOutputTool {
-    pub manager: SharedTaskManager,
+    pub registry: SharedTaskRegistry,
 }
 
 #[async_trait]
@@ -123,19 +107,10 @@ impl Tool for TaskOutputTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'task_id' parameter"))?;
 
-        let mgr = self
-            .manager
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Task manager lock error: {}", e))?;
-
-        match mgr.get_output(task_id) {
+        // Use collect_output to poll the child process (fixes stale-data bug).
+        match crate::tasks::shell::collect_output(&self.registry, task_id) {
             Some((status, stdout, stderr)) => {
-                let status_str = match status {
-                    TaskStatus::Running => "running",
-                    TaskStatus::Completed => "completed",
-                    TaskStatus::Failed => "failed",
-                    TaskStatus::Stopped => "stopped",
-                };
+                let status_str = format!("{:?}", status).to_lowercase();
                 Ok(ToolResult::ok(json!({
                     "task_id": task_id,
                     "status": status_str,
@@ -154,7 +129,7 @@ impl Tool for TaskOutputTool {
 
 /// Stop a running background task.
 pub struct TaskStopTool {
-    pub manager: SharedTaskManager,
+    pub registry: SharedTaskRegistry,
 }
 
 #[async_trait]
@@ -189,20 +164,14 @@ impl Tool for TaskStopTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'task_id' parameter"))?;
 
-        let mut mgr = self
-            .manager
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Task manager lock error: {}", e))?;
-
-        if mgr.stop(task_id) {
-            Ok(ToolResult::ok(json!({
+        match crate::tasks::stop::stop_task(&self.registry, task_id) {
+            Ok(()) => Ok(ToolResult::ok(json!({
                 "task_id": task_id,
-                "status": "stopped"
-            })))
-        } else {
-            Ok(ToolResult::err(json!({
-                "error": format!("Task '{}' not found or already stopped", task_id)
-            })))
+                "status": "killed"
+            }))),
+            Err(e) => Ok(ToolResult::err(json!({
+                "error": e.to_string()
+            }))),
         }
     }
 }

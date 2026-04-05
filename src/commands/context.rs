@@ -18,14 +18,13 @@ impl Command for ContextCommand {
     }
 
     fn execute(&self, _args: &str, ctx: &CommandContext) -> anyhow::Result<CommandResult> {
-        let mut lines = Vec::new();
-        lines.push("  Context Sources".to_string());
-        lines.push("  ===============".to_string());
-
-        // CLAUDE.md files
-        lines.push(String::new());
-        lines.push("  CLAUDE.md Files".to_string());
-        lines.push("  ---------------".to_string());
+        let mut lines = vec![
+            "  Context Sources".to_string(),
+            "  ===============".to_string(),
+            String::new(),
+            "  CLAUDE.md Files".to_string(),
+            "  ---------------".to_string(),
+        ];
 
         let claudemd_paths = [
             dirs::home_dir()

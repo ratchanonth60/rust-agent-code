@@ -26,6 +26,7 @@ pub mod model;
 pub mod output_style;
 pub mod permissions_cmd;
 pub mod plan;
+pub mod settings_cmd;
 pub mod stats;
 pub mod status;
 pub mod vim;
@@ -61,6 +62,7 @@ pub fn build_default_registry() -> CommandRegistry {
     reg.register(Box::new(fast::FastCommand));
     reg.register(Box::new(plan::PlanCommand));
     reg.register(Box::new(permissions_cmd::PermissionsCommand));
+    reg.register(Box::new(settings_cmd::SettingsCommand));
 
     // Information
     reg.register(Box::new(stats::StatsCommand));

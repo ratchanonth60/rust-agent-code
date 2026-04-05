@@ -205,7 +205,7 @@ impl KeybindingAction {
     /// Parses an action string like `"chat:submit"` or `"command:commit"`.
     ///
     /// Returns `None` for unrecognised action strings.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_action(s: &str) -> Option<Self> {
         if let Some(cmd) = s.strip_prefix("command:") {
             return Some(Self::Command(cmd.to_string()));
         }

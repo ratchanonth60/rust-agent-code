@@ -18,18 +18,13 @@ impl Command for DoctorCommand {
     }
 
     fn execute(&self, _args: &str, ctx: &CommandContext) -> anyhow::Result<CommandResult> {
-        let mut lines = Vec::new();
-        lines.push("  System Health Check".to_string());
-        lines.push("  ===================".to_string());
-
-        // Git
-        lines.push(check_tool("git", &["--version"], &ctx.cwd));
-
-        // ripgrep (rg)
-        lines.push(check_tool("rg", &["--version"], &ctx.cwd));
-
-        // bash
-        lines.push(check_tool("bash", &["--version"], &ctx.cwd));
+        let mut lines = vec![
+            "  System Health Check".to_string(),
+            "  ===================".to_string(),
+            check_tool("git", &["--version"], &ctx.cwd),
+            check_tool("rg", &["--version"], &ctx.cwd),
+            check_tool("bash", &["--version"], &ctx.cwd),
+        ];
 
         // Git repository status
         let git_repo = std::process::Command::new("git")

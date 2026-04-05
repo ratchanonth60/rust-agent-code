@@ -9,12 +9,17 @@ use ratatui::{
     text::{Line, Span},
 };
 
+use crate::ui::highlight::highlight_code;
+
 /// Render a markdown string into a list of styled ratatui `Line`s.
 ///
 /// Handles: headings, bold, italic, code spans, code blocks, lists, and block quotes.
 /// Code blocks are collected and can optionally be syntax highlighted via
 /// [`crate::ui::highlight::highlight_code`].
 pub fn render_markdown(text: &str, _width: usize) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return vec![Line::from("")];
+    }
     let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let parser = Parser::new_ext(text, options);
 
@@ -88,14 +93,32 @@ pub fn render_markdown(text: &str, _width: usize) -> Vec<Line<'static>> {
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
-                    // Render code block lines with code styling
-                    let code_style = Style::default().fg(Color::Green);
-                    for code_line in code_block_buf.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("  ", Style::default()),
-                            Span::styled(code_line.to_string(), code_style),
-                        ]));
+                    let dim = Style::default().fg(Color::DarkGray);
+
+                    // Top border: "  ┌─ lang ─"
+                    let lang_label = if code_lang.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {} ", code_lang)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(format!("┌─{}", lang_label), dim),
+                    ]));
+
+                    // Syntax-highlighted code lines
+                    let highlighted = highlight_code(&code_block_buf, &code_lang);
+                    for hl_line in highlighted {
+                        let mut spans = vec![Span::styled("  │ ", dim)];
+                        spans.extend(hl_line.spans);
+                        lines.push(Line::from(spans));
                     }
+
+                    // Bottom border
+                    lines.push(Line::from(vec![
+                        Span::styled("  └─", dim),
+                    ]));
+
                     code_block_buf.clear();
                     code_lang.clear();
                 }
@@ -144,6 +167,27 @@ pub fn render_markdown(text: &str, _width: usize) -> Vec<Line<'static>> {
         }
     }
 
+    // Flush incomplete code block (streaming mid-fence)
+    if in_code_block && !code_block_buf.is_empty() {
+        let dim = Style::default().fg(Color::DarkGray);
+        let lang_label = if code_lang.is_empty() {
+            String::new()
+        } else {
+            format!(" {} ", code_lang)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(format!("┌─{}", lang_label), dim),
+        ]));
+        let highlighted = highlight_code(&code_block_buf, &code_lang);
+        for hl_line in highlighted {
+            let mut spans = vec![Span::styled("  │ ", dim)];
+            spans.extend(hl_line.spans);
+            lines.push(Line::from(spans));
+        }
+        // No bottom border — code block is still being streamed
+    }
+
     flush_line(&mut current_spans, &mut lines);
     lines
 }
@@ -183,11 +227,30 @@ mod tests {
     fn renders_code_block() {
         let input = "```rust\nfn main() {}\n```";
         let lines = render_markdown(input, 80);
-        let all_text: String = lines.iter()
+        // Should have: top border + highlighted code line + bottom border (at minimum 3)
+        assert!(lines.len() >= 3, "Expected at least border + code + border");
+        let all_text: String = lines
+            .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.to_string())
             .collect::<Vec<_>>()
-            .join(" ");
+            .join("");
+        assert!(all_text.contains("fn main()"));
+        // Check top border has language label
+        assert!(all_text.contains("rust"));
+    }
+
+    #[test]
+    fn renders_incomplete_code_block() {
+        // Simulates streaming: no closing fence
+        let input = "```rust\nfn main() {";
+        let lines = render_markdown(input, 80);
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.to_string())
+            .collect::<Vec<_>>()
+            .join("");
         assert!(all_text.contains("fn main()"));
     }
 }
