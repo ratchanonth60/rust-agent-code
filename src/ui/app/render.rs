@@ -345,6 +345,13 @@ impl App {
         };
         let left = format!(" {} rust-agent | {} ", pulse, left_body);
 
+        // Middle: background task pill (if any running)
+        let task_pill = self
+            .task_registry
+            .as_ref()
+            .map(crate::tasks::pill_label::pill_label)
+            .unwrap_or_default();
+
         // Right: cost if available
         let right = if let Some(ref tracker) = self.cost_tracker {
             if let Ok(t) = tracker.lock() {
@@ -360,15 +367,23 @@ impl App {
             String::new()
         };
 
-        let fill_len = w.saturating_sub(left.len() + right.len());
+        let fill_len = w.saturating_sub(left.len() + task_pill.len() + right.len());
         let rail_char = RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()];
         let fill: String = std::iter::repeat_n(rail_char, fill_len).collect();
 
-        let line = Line::from(vec![
+        let mut spans = vec![
             Span::styled(left, Style::default().fg(Color::Cyan)),
             Span::styled(fill, dim),
-            Span::styled(right, Style::default().fg(Color::Green)),
-        ]);
+        ];
+        if !task_pill.is_empty() {
+            spans.push(Span::styled(
+                task_pill,
+                Style::default().fg(Color::Black).bg(Color::Yellow),
+            ));
+        }
+        spans.push(Span::styled(right, Style::default().fg(Color::Green)));
+
+        let line = Line::from(spans);
 
         f.render_widget(Paragraph::new(vec![line]), area);
     }

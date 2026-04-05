@@ -18,6 +18,7 @@ pub mod output_styles;
 pub mod permissions;
 pub mod plugins;
 pub mod skills;
+pub mod tasks;
 pub mod tools;
 pub mod ui;
 
@@ -229,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
         let (tx_to_ui, rx_to_ui) = mpsc::channel::<ui::app::UiEvent>(32);
 
         let cost_tracker = engine.cost_tracker.clone();
+        let task_registry = engine.task_registry.clone();
         let engine_clone = std::sync::Arc::new(engine);
 
         tokio::spawn(async move {
@@ -253,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
         let mut terminal = ui::setup_terminal()?;
         let mut app = ui::app::App::new(tx_to_engine, rx_to_ui, question_rx, command_registry);
         app.cost_tracker = Some(cost_tracker.clone());
+        app.task_registry = Some(task_registry);
 
         let app_result = app.run(&mut terminal).await;
 

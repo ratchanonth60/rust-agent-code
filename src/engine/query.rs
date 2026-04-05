@@ -71,6 +71,8 @@ pub struct QueryEngine {
     pub cwd: std::path::PathBuf,
     /// Shared todo list state.
     pub todo_list: crate::tools::todo::SharedTodoList,
+    /// Unified task registry for background shell and agent tasks.
+    pub task_registry: crate::tasks::SharedTaskRegistry,
     /// Active session for auto-save persistence.
     pub session: Arc<Mutex<Session>>,
 }
@@ -149,7 +151,7 @@ impl QueryEngine {
         };
 
         let todo_list = crate::tools::todo::new_shared_todo_list();
-        let tools = crate::tools::registry::default_tools(todo_list.clone(), question_tx);
+        let (tools, task_registry) = crate::tools::registry::default_tools(todo_list.clone(), question_tx);
         let model_str: String = model.into();
 
         // Create a session for auto-save persistence
@@ -171,6 +173,7 @@ impl QueryEngine {
             permission_rules: Arc::new(Mutex::new(Vec::new())),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             todo_list,
+            task_registry,
             session: Arc::new(Mutex::new(session)),
         })
     }
@@ -191,6 +194,7 @@ impl QueryEngine {
             self.model.clone(),
             self.provider,
             self.config.clone(),
+            self.task_registry.clone(),
         )));
         self
     }

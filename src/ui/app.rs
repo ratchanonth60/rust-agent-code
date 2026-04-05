@@ -154,6 +154,8 @@ pub struct App {
     /// Pending question from AskUserQuestionTool awaiting user input.
     pending_question: Option<PendingQuestion>,
     pub cost_tracker: Option<Arc<Mutex<crate::engine::cost_tracker::CostTracker>>>,
+    /// Shared task registry for background task pill display.
+    pub task_registry: Option<crate::tasks::SharedTaskRegistry>,
     /// Terminal width for divider rendering.
     term_width: u16,
     /// Conversation area height (updated each frame).
@@ -239,6 +241,7 @@ impl App {
             pending_permission: None,
             pending_question: None,
             cost_tracker: None,
+            task_registry: None,
             term_width: 80,
             conv_height: 24,
             waiting_for_response: false,

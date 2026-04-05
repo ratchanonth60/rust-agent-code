@@ -4,31 +4,44 @@
 //! configuration as the parent, but **without** `AgentTool` registered.  This
 //! prevents infinite recursion while still allowing the parent agent to
 //! delegate work to an isolated child context.
+//!
+//! Agent tasks are registered in the unified [`TaskRegistry`] for status
+//! tracking and TUI pill display.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::engine::config::EngineConfig;
 use crate::engine::query::{ModelProvider, QueryEngine};
+use crate::tasks::SharedTaskRegistry;
 use crate::tools::{Tool, ToolContext, ToolResult};
 
 /// Spawns a sub-agent for complex delegated tasks.
 ///
 /// The sub-agent runs in a fresh [`QueryEngine`] context (fresh message
 /// history, no `AgentTool` registered) and returns its final text answer.
+/// The task is tracked in the [`TaskRegistry`](crate::tasks::TaskRegistry)
+/// so the TUI can display a running task count.
 pub struct AgentTool {
     model: String,
     provider: ModelProvider,
     config: EngineConfig,
+    registry: SharedTaskRegistry,
 }
 
 impl AgentTool {
     /// Create an `AgentTool` with the same model/provider/config as the parent engine.
-    pub fn new(model: String, provider: ModelProvider, config: EngineConfig) -> Self {
+    pub fn new(
+        model: String,
+        provider: ModelProvider,
+        config: EngineConfig,
+        registry: SharedTaskRegistry,
+    ) -> Self {
         Self {
             model,
             provider,
             config,
+            registry,
         }
     }
 }
@@ -73,6 +86,22 @@ impl Tool for AgentTool {
             _ => return Ok(ToolResult::err(json!({"error": "prompt is required"}))),
         };
 
+        let description = input["description"]
+            .as_str()
+            .unwrap_or("sub-agent")
+            .to_string();
+
+        let agent_id = uuid::Uuid::new_v4().to_string();
+
+        // Register the agent task before execution.
+        let task_id = crate::tasks::agent::register(
+            &self.registry,
+            &prompt,
+            &agent_id,
+            &description,
+        )
+        .unwrap_or_default();
+
         // Build a sub-agent without AgentTool to prevent infinite recursion.
         let mut sub_config = self.config.clone();
         sub_config.auto_mode = true; // sub-agents run non-interactively
@@ -81,8 +110,15 @@ impl Tool for AgentTool {
             QueryEngine::new(self.model.clone(), self.provider, None, None, sub_config, None)?;
 
         match sub_engine.query(&prompt, None).await {
-            Ok(result) => Ok(ToolResult::ok(json!({"result": result}))),
-            Err(e) => Ok(ToolResult::err(json!({"error": e.to_string()}))),
+            Ok(result) => {
+                crate::tasks::agent::complete(&self.registry, &task_id, &result);
+                Ok(ToolResult::ok(json!({"result": result})))
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                crate::tasks::agent::fail(&self.registry, &task_id, &err_msg);
+                Ok(ToolResult::err(json!({"error": err_msg})))
+            }
         }
     }
 }
