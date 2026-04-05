@@ -7,14 +7,18 @@
 //!
 //! Supported providers:
 //! - **Claude** — native Anthropic Messages API with SSE streaming
-//! - **OpenAI / Gemini / OpenAI-compatible** — via [`async_openai`]
+//! - **OpenAI / Gemini / OpenAI-compatible** — via [`async_openai`] with streaming support
 
 use anyhow::{anyhow, Context, Result};
-use futures_util::future::join_all;
+use futures_util::{future::join_all, StreamExt};
 use async_openai::{
     config::OpenAIConfig,
     types::{
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionToolArgs, ChatCompletionToolType, CreateChatCompletionRequestArgs, FunctionObjectArgs
+        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionToolArgs,
+        ChatCompletionToolType, CreateChatCompletionRequestArgs, FunctionCall, FunctionObjectArgs,
     },
     Client,
 };
@@ -81,16 +85,21 @@ impl QueryEngine {
         question_tx: Option<crate::tools::ask_user::QuestionSender>,
     ) -> Result<Self> {
         let openai_client = match provider {
-            // Claude and Gemini have their own HTTP paths; no async_openai client needed.
-            ModelProvider::Claude | ModelProvider::Gemini => None,
+            // Claude has its own native HTTP path; no async_openai client needed.
+            ModelProvider::Claude => None,
             _ => {
-                let mut config = OpenAIConfig::default();
+                let mut oai_config = OpenAIConfig::default();
 
                 let resolved_api_key = api_key.unwrap_or_else(|| match provider {
                     ModelProvider::OpenAI => std::env::var("OPENAI_API_KEY").unwrap_or_default(),
                     ModelProvider::OpenAICompatible => {
                         std::env::var("OPENAI_COMPAT_API_KEY")
                             .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                            .or_else(|_| std::env::var("LLM_API_KEY"))
+                            .unwrap_or_default()
+                    }
+                    ModelProvider::Gemini => {
+                        std::env::var("GEMINI_API_KEY")
                             .or_else(|_| std::env::var("LLM_API_KEY"))
                             .unwrap_or_default()
                     }
@@ -101,6 +110,7 @@ impl QueryEngine {
                     let env_var_desc = match provider {
                         ModelProvider::OpenAI => "OPENAI_API_KEY",
                         ModelProvider::OpenAICompatible => "OPENAI_COMPAT_API_KEY, OPENAI_API_KEY, or LLM_API_KEY",
+                        ModelProvider::Gemini => "GEMINI_API_KEY",
                         _ => unreachable!(),
                     };
                     return Err(anyhow!(
@@ -110,21 +120,26 @@ impl QueryEngine {
                     ));
                 }
 
-                config = config.with_api_key(resolved_api_key);
+                oai_config = oai_config.with_api_key(resolved_api_key);
 
                 let resolved_api_base = match provider {
                     ModelProvider::OpenAI => api_base,
                     ModelProvider::OpenAICompatible => api_base
                         .or_else(|| std::env::var("OPENAI_COMPAT_API_BASE").ok())
                         .or_else(|| std::env::var("OPENAI_API_BASE").ok()),
+                    ModelProvider::Gemini => {
+                        let base = std::env::var("GEMINI_API_BASE")
+                            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+                        Some(format!("{}/v1beta/openai", base.trim_end_matches('/')))
+                    }
                     _ => None,
                 };
 
                 if let Some(base) = resolved_api_base {
-                    config = config.with_api_base(base);
+                    oai_config = oai_config.with_api_base(base);
                 }
 
-                Some(Client::with_config(config))
+                Some(Client::with_config(oai_config))
             }
         };
 
@@ -330,171 +345,8 @@ impl QueryEngine {
 
         match self.provider {
             ModelProvider::Claude => self.query_claude(input, &system_prompt, &ctx, tx_ui, context_window).await,
-            ModelProvider::Gemini => self.query_gemini(input, &system_prompt, &ctx, tx_ui).await,
+            ModelProvider::Gemini => self.query_gemini_compat(input, &system_prompt, &ctx, tx_ui, context_window).await,
             _ => self.query_openai_compatible(input, &system_prompt, &ctx, tx_ui, context_window).await,
-        }
-    }
-
-    /// Resolves the Gemini API key from environment variables.
-    fn get_gemini_key(&self) -> String {
-        std::env::var("GEMINI_API_KEY")
-            .or_else(|_| std::env::var("LLM_API_KEY"))
-            .unwrap_or_default()
-    }
-
-    /// Gemini-native agentic loop using direct HTTP (not async_openai).
-    ///
-    /// Gemini's thinking models include a `thought_signature` in tool-use
-    /// responses that must be echoed back in the following assistant message.
-    /// `async_openai` has no awareness of this field, so we manage the
-    /// conversation as raw JSON via our `http_client`.
-    async fn query_gemini(
-        &self,
-        input: &str,
-        system_prompt: &str,
-        ctx: &ToolContext,
-        tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
-    ) -> Result<String> {
-        let api_key = self.get_gemini_key();
-        if api_key.is_empty() {
-            return Err(anyhow!("GEMINI_API_KEY is required for Gemini provider"));
-        }
-
-        let gemini_base = std::env::var("GEMINI_API_BASE")
-            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
-        let url = format!(
-            "{}/v1beta/openai/chat/completions",
-            gemini_base.trim_end_matches('/')
-        );
-
-        // Build tools in OpenAI function-calling format
-        let tools: Vec<Value> = self.tools.iter().map(|t| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name(),
-                    "description": t.description(),
-                    "parameters": t.input_schema()
-                }
-            })
-        }).collect();
-
-        let mut messages: Vec<Value> = vec![
-            serde_json::json!({"role": "system", "content": system_prompt}),
-            serde_json::json!({"role": "user",   "content": input}),
-        ];
-
-        loop {
-            let request_body = serde_json::json!({
-                "model":      &self.model,
-                "max_tokens": self.config.max_tokens,
-                "messages":   &messages,
-                "tools":      &tools,
-            });
-
-            let api_start = Instant::now();
-            let response = self.http_client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&request_body)
-                .send().await?;
-            let api_duration = api_start.elapsed().as_millis() as u64;
-
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(anyhow!("Gemini API error {}: {}", status, body));
-            }
-
-            let resp: Value = response.json().await?;
-
-            // Track cost
-            if let Some(usage) = resp.get("usage") {
-                let input_tok  = usage["prompt_tokens"].as_u64().unwrap_or(0);
-                let output_tok = usage["completion_tokens"].as_u64().unwrap_or(0);
-                let cost = calculate_cost(&self.model, input_tok, output_tok);
-                if let Ok(mut tracker) = self.cost_tracker.lock() {
-                    tracker.add_usage(&self.model, input_tok, output_tok, cost);
-                    tracker.total_api_duration_ms += api_duration;
-                }
-            }
-
-            let choices = resp["choices"]
-                .as_array()
-                .filter(|a| !a.is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Gemini response missing or empty 'choices' array. Response: {}",
-                        resp
-                    )
-                })?;
-            let msg = choices[0]
-                .get("message")
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Gemini response choices[0] missing 'message' field. Response: {}",
-                        resp
-                    )
-                })?;
-            let content     = msg["content"].as_str().unwrap_or("").to_string();
-            let thought_sig = msg["extra_content"]["google"]["thought_signature"]
-                .as_str().map(String::from);
-            let tool_calls  = msg["tool_calls"].as_array().cloned().unwrap_or_default();
-
-            // Build assistant message, preserving thought_signature for thinking models
-            let mut asst_msg = serde_json::json!({
-                "role": "assistant",
-                "content": if content.is_empty() { Value::Null } else { Value::String(content.clone()) },
-                "tool_calls": &tool_calls,
-            });
-            if let Some(ts) = thought_sig {
-                asst_msg["extra_content"] = serde_json::json!({"google": {"thought_signature": ts}});
-            }
-            messages.push(asst_msg);
-
-            if tool_calls.is_empty() {
-                return Ok(content);
-            }
-
-            // Execute all tool calls and collect results
-            for tc in &tool_calls {
-                let tc_id     = tc["id"].as_str().unwrap_or("").to_string();
-                let tool_name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                let args_str  = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                let tool_input: Value = serde_json::from_str(args_str)
-                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
-
-                let result_content = if let Some(tool) = self.find_tool(&tool_name) {
-                    if let Some(ref tx) = tx_ui {
-                        let _ = tx.send(crate::ui::app::UiEvent::ToolStarted(tool_name.clone())).await;
-                    }
-                    let allowed = self.check_tool_permission(tool, &tool_input, &tx_ui).await?;
-                    if !allowed {
-                        format!("Permission denied for tool '{}'.", tool_name)
-                    } else {
-                        let exec = tool.call(tool_input, ctx).await;
-                        if let Some(ref tx) = tx_ui {
-                            let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(tool_name.clone())).await;
-                        }
-                        match exec {
-                            Ok(res) => serde_json::to_string(&res.output).unwrap_or_else(|_| "{}".to_string()),
-                            Err(e)  => format!("Error executing tool: {}", e),
-                        }
-                    }
-                } else {
-                    format!("Error: Tool '{}' not found.", tool_name)
-                };
-
-                messages.push(serde_json::json!({
-                    "role":         "tool",
-                    "tool_call_id": tc_id,
-                    "content":      result_content,
-                }));
-            }
-
-            // Auto-save session after Gemini tool-use round-trip
-            self.auto_save_session(&messages);
         }
     }
 
@@ -550,112 +402,647 @@ impl QueryEngine {
                 }
             }
 
-            let req = CreateChatCompletionRequestArgs::default()
-                .max_tokens(self.config.max_tokens as u16)
-                .model(&self.model)
-                .messages(messages.clone())
-                .tools(openai_tools.clone())
-                .build()
-                .context("Failed to construct Chat Request")?;
+            if tx_ui.is_some() {
+                // ── Streaming path ───────────────────────────────────────────
+                let req = CreateChatCompletionRequestArgs::default()
+                    .max_tokens(self.config.max_tokens as u16)
+                    .model(&self.model)
+                    .messages(messages.clone())
+                    .tools(openai_tools.clone())
+                    .stream_options(ChatCompletionStreamOptions { include_usage: true })
+                    .build()
+                    .context("Failed to construct Chat Request")?;
 
-            let api_start = Instant::now();
-            let response = client.chat().create(req).await?;
-            let api_duration = api_start.elapsed().as_millis() as u64;
+                let api_start = Instant::now();
+                let mut stream = client.chat().create_stream(req).await?;
 
-            // Track usage/cost from OpenAI response
-            if let Some(ref usage) = response.usage {
-                let input_tok = usage.prompt_tokens as u64;
-                let output_tok = usage.completion_tokens as u64;
-                let cost = calculate_cost(&self.model, input_tok, output_tok);
-                if let Ok(mut tracker) = self.cost_tracker.lock() {
-                    tracker.add_usage(&self.model, input_tok, output_tok, cost);
-                    tracker.total_api_duration_ms += api_duration;
+                if let Some(ref tx) = tx_ui {
+                    let _ = tx.send(crate::ui::app::UiEvent::StreamStart).await;
                 }
-            }
 
-            let choice = response.choices.first().ok_or_else(|| anyhow!("No choices returned"))?;
-            let message = &choice.message;
+                let mut accumulated_text = String::new();
+                // index -> (id, accumulated_name, accumulated_arguments)
+                let mut tool_acc: std::collections::HashMap<i32, (String, String, String)> =
+                    std::collections::HashMap::new();
+                let mut usage_data: Option<(u64, u64)> = None;
 
-            // Append assistant's response to the conversation
-            let mut asst_msg = ChatCompletionRequestAssistantMessageArgs::default();
-            if let Some(ref content) = message.content {
-                asst_msg.content(content.clone());
-            }
-            if let Some(ref tool_calls) = message.tool_calls {
-                asst_msg.tool_calls(tool_calls.clone());
-            }
-            messages.push(asst_msg.build()?.into());
-
-            // Check if there are tool calls to execute
-            if let Some(ref tool_calls) = message.tool_calls {
-                for call in tool_calls {
-                    let func_name = &call.function.name;
-                    let func_args = &call.function.arguments;
-                    if let Some(tool) = self.find_tool(func_name) {
-                        info!("Executing tool: {} with args: {}", func_name, func_args);
-
-                        let args_val: Value = serde_json::from_str(func_args)?;
-
-                        // Permission check
-                        let allowed = self.check_tool_permission(tool, &args_val, &tx_ui).await?;
-                        if !allowed {
-                            messages.push(
-                                ChatCompletionRequestToolMessageArgs::default()
-                                    .tool_call_id(call.id.clone())
-                                    .content(format!("Permission denied for tool '{}'.", func_name))
-                                    .build()?
-                                    .into()
-                            );
-                            continue;
-                        }
-
-                        if let Some(ref tx) = tx_ui {
-                            let _ = tx
-                                .send(crate::ui::app::UiEvent::ToolStarted(func_name.to_string()))
-                                .await;
-                        }
-
-                        let exec_result = tool.call(args_val, ctx).await;
-
-                        if let Some(ref tx) = tx_ui {
-                            let _ = tx
-                                .send(crate::ui::app::UiEvent::ToolFinished(func_name.to_string()))
-                                .await;
-                        }
-
-                        let content = match exec_result {
-                            Ok(res) => {
-                                serde_json::to_string(&res.output).unwrap_or_else(|_| "success".to_string())
+                while let Some(chunk_result) = stream.next().await {
+                    let chunk = chunk_result?;
+                    if let Some(usage) = chunk.usage {
+                        usage_data = Some((usage.prompt_tokens as u64, usage.completion_tokens as u64));
+                    }
+                    if let Some(choice) = chunk.choices.first() {
+                        if let Some(ref content) = choice.delta.content {
+                            accumulated_text.push_str(content);
+                            if let Some(ref tx) = tx_ui {
+                                let _ = tx.send(crate::ui::app::UiEvent::StreamDelta(content.clone())).await;
                             }
-                            Err(e) => format!("Error executing tool: {}", e),
-                        };
+                        }
+                        if let Some(ref delta_tcs) = choice.delta.tool_calls {
+                            for dtc in delta_tcs {
+                                let entry = tool_acc
+                                    .entry(dtc.index)
+                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                if let Some(ref id) = dtc.id {
+                                    entry.0 = id.clone();
+                                }
+                                if let Some(ref func) = dtc.function {
+                                    if let Some(ref name) = func.name {
+                                        // Fire ToolStarted only on the first chunk for this call
+                                        if entry.1.is_empty() {
+                                            if let Some(ref tx) = tx_ui {
+                                                let _ = tx.send(crate::ui::app::UiEvent::ToolStarted(name.clone())).await;
+                                            }
+                                        }
+                                        entry.1.push_str(name);
+                                    }
+                                    if let Some(ref args) = func.arguments {
+                                        entry.2.push_str(args);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(stream);
+                let api_duration = api_start.elapsed().as_millis() as u64;
 
-                        messages.push(
-                            ChatCompletionRequestToolMessageArgs::default()
-                                .tool_call_id(call.id.clone())
-                                .content(content)
-                                .build()?
-                                .into()
-                        );
-                    } else {
-                        messages.push(
-                            ChatCompletionRequestToolMessageArgs::default()
-                                .tool_call_id(call.id.clone())
-                                .content(format!("Error: Tool '{}' not found.", func_name))
-                                .build()?
-                                .into(),
-                        );
+                if let Some(ref tx) = tx_ui {
+                    let _ = tx.send(crate::ui::app::UiEvent::StreamEnd).await;
+                }
+
+                if let Some((input_tok, output_tok)) = usage_data {
+                    let cost = calculate_cost(&self.model, input_tok, output_tok);
+                    if let Ok(mut tracker) = self.cost_tracker.lock() {
+                        tracker.add_usage(&self.model, input_tok, output_tok, cost);
+                        tracker.total_api_duration_ms += api_duration;
                     }
                 }
 
-                // Auto-save session after OpenAI tool-use round-trip
+                // Collect tool calls sorted by stream index
+                let mut sorted_tcs: Vec<(i32, String, String, String)> = tool_acc
+                    .into_iter()
+                    .map(|(k, v)| (k, v.0, v.1, v.2))
+                    .collect();
+                sorted_tcs.sort_by_key(|e| e.0);
+
+                if sorted_tcs.is_empty() {
+                    return Ok(accumulated_text);
+                }
+
+                // Reconstruct assistant message with tool_calls for conversation history
+                let tool_calls_for_msg: Vec<ChatCompletionMessageToolCall> = sorted_tcs
+                    .iter()
+                    .map(|(_, id, name, args)| ChatCompletionMessageToolCall {
+                        id: id.clone(),
+                        r#type: ChatCompletionToolType::Function,
+                        function: FunctionCall { name: name.clone(), arguments: args.clone() },
+                    })
+                    .collect();
+                let mut asst_builder = ChatCompletionRequestAssistantMessageArgs::default();
+                if !accumulated_text.is_empty() {
+                    asst_builder.content(accumulated_text);
+                }
+                asst_builder.tool_calls(tool_calls_for_msg);
+                messages.push(asst_builder.build()?.into());
+
+                for (_, id, name, args) in &sorted_tcs {
+                    let tool_input: Value = serde_json::from_str(args)
+                        .unwrap_or(Value::Object(serde_json::Map::new()));
+                    let result_content = if let Some(tool) = self.find_tool(name) {
+                        let allowed = self.check_tool_permission(tool, &tool_input, &tx_ui).await?;
+                        if !allowed {
+                            format!("Permission denied for tool '{}'.", name)
+                        } else {
+                            let exec = tool.call(tool_input, ctx).await;
+                            if let Some(ref tx) = tx_ui {
+                                let _ = tx.send(crate::ui::app::UiEvent::ToolFinished(name.clone())).await;
+                            }
+                            match exec {
+                                Ok(res) => serde_json::to_string(&res.output)
+                                    .unwrap_or_else(|_| "success".to_string()),
+                                Err(e) => format!("Error executing tool: {}", e),
+                            }
+                        }
+                    } else {
+                        format!("Error: Tool '{}' not found.", name)
+                    };
+                    messages.push(
+                        ChatCompletionRequestToolMessageArgs::default()
+                            .tool_call_id(id.clone())
+                            .content(result_content)
+                            .build()?
+                            .into(),
+                    );
+                }
+
                 let json_msgs: Vec<Value> = messages.iter()
                     .filter_map(|m| serde_json::to_value(m).ok())
                     .collect();
                 self.auto_save_session(&json_msgs);
+
             } else {
-                // No tool calls, return purely text content
-                return Ok(message.content.clone().unwrap_or_default());
+                // ── Non-streaming path ───────────────────────────────────────
+                let req = CreateChatCompletionRequestArgs::default()
+                    .max_tokens(self.config.max_tokens as u16)
+                    .model(&self.model)
+                    .messages(messages.clone())
+                    .tools(openai_tools.clone())
+                    .build()
+                    .context("Failed to construct Chat Request")?;
+
+                let api_start = Instant::now();
+                let response = client.chat().create(req).await?;
+                let api_duration = api_start.elapsed().as_millis() as u64;
+
+                if let Some(ref usage) = response.usage {
+                    let input_tok = usage.prompt_tokens as u64;
+                    let output_tok = usage.completion_tokens as u64;
+                    let cost = calculate_cost(&self.model, input_tok, output_tok);
+                    if let Ok(mut tracker) = self.cost_tracker.lock() {
+                        tracker.add_usage(&self.model, input_tok, output_tok, cost);
+                        tracker.total_api_duration_ms += api_duration;
+                    }
+                }
+
+                let choice = response.choices.first().ok_or_else(|| anyhow!("No choices returned"))?;
+                let message = &choice.message;
+
+                let mut asst_msg = ChatCompletionRequestAssistantMessageArgs::default();
+                if let Some(ref content) = message.content {
+                    asst_msg.content(content.clone());
+                }
+                if let Some(ref tool_calls) = message.tool_calls {
+                    asst_msg.tool_calls(tool_calls.clone());
+                }
+                messages.push(asst_msg.build()?.into());
+
+                if let Some(ref tool_calls) = message.tool_calls {
+                    for call in tool_calls {
+                        let func_name = &call.function.name;
+                        let func_args = &call.function.arguments;
+                        if let Some(tool) = self.find_tool(func_name) {
+                            info!("Executing tool: {} with args: {}", func_name, func_args);
+                            let args_val: Value = serde_json::from_str(func_args)?;
+                            let allowed = self.check_tool_permission(tool, &args_val, &tx_ui).await?;
+                            if !allowed {
+                                messages.push(
+                                    ChatCompletionRequestToolMessageArgs::default()
+                                        .tool_call_id(call.id.clone())
+                                        .content(format!("Permission denied for tool '{}'.", func_name))
+                                        .build()?
+                                        .into(),
+                                );
+                                continue;
+                            }
+                            let exec_result = tool.call(args_val, ctx).await;
+                            let content = match exec_result {
+                                Ok(res) => serde_json::to_string(&res.output)
+                                    .unwrap_or_else(|_| "success".to_string()),
+                                Err(e) => format!("Error executing tool: {}", e),
+                            };
+                            messages.push(
+                                ChatCompletionRequestToolMessageArgs::default()
+                                    .tool_call_id(call.id.clone())
+                                    .content(content)
+                                    .build()?
+                                    .into(),
+                            );
+                        } else {
+                            messages.push(
+                                ChatCompletionRequestToolMessageArgs::default()
+                                    .tool_call_id(call.id.clone())
+                                    .content(format!("Error: Tool '{}' not found.", func_name))
+                                    .build()?
+                                    .into(),
+                            );
+                        }
+                    }
+                    let json_msgs: Vec<Value> = messages.iter()
+                        .filter_map(|m| serde_json::to_value(m).ok())
+                        .collect();
+                    self.auto_save_session(&json_msgs);
+                } else {
+                    return Ok(message.content.clone().unwrap_or_default());
+                }
+            }
+        }
+    }
+
+    /// Resolves the Gemini API key from environment variables.
+    fn get_gemini_key(&self) -> String {
+        std::env::var("GEMINI_API_KEY")
+            .or_else(|_| std::env::var("LLM_API_KEY"))
+            .unwrap_or_default()
+    }
+
+    /// Returns the Gemini OpenAI-compat chat completions endpoint.
+    fn get_gemini_endpoint(&self) -> String {
+        let base = std::env::var("GEMINI_API_BASE")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        format!("{}/v1beta/openai/chat/completions", base.trim_end_matches('/'))
+    }
+
+    /// Converts registered tools to raw JSON (for providers using direct HTTP).
+    fn get_tools_json(&self) -> Vec<Value> {
+        self.tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name(),
+                        "description": t.description(),
+                        "parameters": t.input_schema(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Gemini-native agentic loop using raw HTTP to the OpenAI-compat endpoint.
+    ///
+    /// Stores messages as [`Value`] so that the `thought_signature` fields
+    /// returned by thinking models (gemini-2.5-pro, gemini-2.5-flash) are
+    /// preserved and echoed back on subsequent turns, which is required for
+    /// multi-turn tool-use correctness.
+    async fn query_gemini_compat(
+        &self,
+        input: &str,
+        system_prompt: &str,
+        ctx: &ToolContext,
+        tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
+        context_window: u64,
+    ) -> Result<String> {
+        let api_key = self.get_gemini_key();
+        if api_key.is_empty() {
+            return Err(anyhow!(
+                "GEMINI_API_KEY (or LLM_API_KEY) is required for Gemini provider"
+            ));
+        }
+
+        let endpoint = self.get_gemini_endpoint();
+        let tools_json = self.get_tools_json();
+        let use_streaming = tx_ui.is_some();
+
+        // Messages stored as Value so thought_signature fields survive round-trips.
+        let mut messages: Vec<Value> = vec![
+            serde_json::json!({"role": "system", "content": system_prompt}),
+            serde_json::json!({"role": "user", "content": input}),
+        ];
+
+        loop {
+            // Microcompact when approaching context limit.
+            {
+                let est_tokens: u64 = messages
+                    .iter()
+                    .map(|v| crate::engine::tokens::estimate_tokens(&v.to_string()))
+                    .sum();
+                if crate::engine::tokens::should_compact(est_tokens, context_window, 0.8) {
+                    info!(
+                        "Approaching context limit ({}/{} est. tokens), clearing old tool results",
+                        est_tokens, context_window
+                    );
+                    crate::engine::compaction::microcompact_openai(&mut messages, 6);
+                }
+            }
+
+            let mut request_body = serde_json::json!({
+                "model": self.model,
+                "max_tokens": self.config.max_tokens,
+                "messages": messages,
+                "tools": tools_json,
+                "stream": use_streaming,
+            });
+            if use_streaming {
+                request_body["stream_options"] = serde_json::json!({"include_usage": true});
+            }
+
+            let api_start = Instant::now();
+            let response = self
+                .http_client
+                .post(&endpoint)
+                .bearer_auth(&api_key)
+                .json(&request_body)
+                .send()
+                .await?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!("Gemini API error {}: {}", status, body));
+            }
+
+            if use_streaming {
+                // ── Streaming path ───────────────────────────────────────────
+                if let Some(ref tx) = tx_ui {
+                    let _ = tx.send(crate::ui::app::UiEvent::StreamStart).await;
+                }
+
+                let mut accumulated_text = String::new();
+                // index -> (id, name, args, thought_signature)
+                let mut tool_acc: std::collections::HashMap<
+                    i32,
+                    (String, String, String, String),
+                > = std::collections::HashMap::new();
+                let mut usage_data: Option<(u64, u64)> = None;
+                let mut byte_stream = response.bytes_stream();
+                let mut sse_buf = String::new();
+
+                while let Some(chunk_result) = byte_stream.next().await {
+                    let chunk = chunk_result.context("Gemini stream read error")?;
+                    sse_buf.push_str(&String::from_utf8_lossy(&chunk));
+
+                    // Process complete SSE events (delimited by "\n\n").
+                    while let Some(pos) = sse_buf.find("\n\n") {
+                        let event = sse_buf[..pos].to_string();
+                        sse_buf = sse_buf[pos + 2..].to_string();
+
+                        for line in event.lines() {
+                            let Some(json_str) = line.strip_prefix("data: ") else {
+                                continue;
+                            };
+                            if json_str == "[DONE]" {
+                                continue;
+                            }
+
+                            let Ok(chunk_json) = serde_json::from_str::<Value>(json_str) else {
+                                continue;
+                            };
+
+                            // Track usage (arrives on the last chunk).
+                            if let Some(usage) = chunk_json.get("usage") {
+                                let inp = usage
+                                    .get("prompt_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let out = usage
+                                    .get("completion_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                if inp > 0 || out > 0 {
+                                    usage_data = Some((inp, out));
+                                }
+                            }
+
+                            if let Some(choices) =
+                                chunk_json.get("choices").and_then(|v| v.as_array())
+                            {
+                                if let Some(choice) = choices.first() {
+                                    let delta = &choice["delta"];
+
+                                    // Accumulate assistant text.
+                                    if let Some(content) =
+                                        delta.get("content").and_then(|v| v.as_str())
+                                    {
+                                        if !content.is_empty() {
+                                            accumulated_text.push_str(content);
+                                            if let Some(ref tx) = tx_ui {
+                                                let _ = tx
+                                                    .send(crate::ui::app::UiEvent::StreamDelta(
+                                                        content.to_string(),
+                                                    ))
+                                                    .await;
+                                            }
+                                        }
+                                    }
+
+                                    // Accumulate tool calls + thought_signatures.
+                                    if let Some(tcs) =
+                                        delta.get("tool_calls").and_then(|v| v.as_array())
+                                    {
+                                        for tc in tcs {
+                                            let idx = tc
+                                                .get("index")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or(0)
+                                                as i32;
+                                            let entry = tool_acc.entry(idx).or_insert_with(|| {
+                                                (
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                    String::new(),
+                                                )
+                                            });
+                                            if let Some(id) =
+                                                tc.get("id").and_then(|v| v.as_str())
+                                            {
+                                                entry.0 = id.to_string();
+                                            }
+                                            if let Some(func) = tc.get("function") {
+                                                if let Some(name) =
+                                                    func.get("name").and_then(|v| v.as_str())
+                                                {
+                                                    if entry.1.is_empty() {
+                                                        if let Some(ref tx) = tx_ui {
+                                                            let _ = tx
+                                                                .send(crate::ui::app::UiEvent::ToolStarted(
+                                                                    name.to_string(),
+                                                                ))
+                                                                .await;
+                                                        }
+                                                    }
+                                                    entry.1.push_str(name);
+                                                }
+                                                if let Some(args) = func
+                                                    .get("arguments")
+                                                    .and_then(|v| v.as_str())
+                                                {
+                                                    entry.2.push_str(args);
+                                                }
+                                            }
+                                            // Accumulate thought_signature across chunks.
+                                            if let Some(sig) = tc
+                                                .get("extra_content")
+                                                .and_then(|ec| ec.get("google"))
+                                                .and_then(|g| g.get("thought_signature"))
+                                                .and_then(|v| v.as_str())
+                                            {
+                                                entry.3.push_str(sig);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let api_duration = api_start.elapsed().as_millis() as u64;
+
+                if let Some(ref tx) = tx_ui {
+                    let _ = tx.send(crate::ui::app::UiEvent::StreamEnd).await;
+                }
+
+                if let Some((inp, out)) = usage_data {
+                    let cost = calculate_cost(&self.model, inp, out);
+                    if let Ok(mut tracker) = self.cost_tracker.lock() {
+                        tracker.add_usage(&self.model, inp, out, cost);
+                        tracker.total_api_duration_ms += api_duration;
+                    }
+                }
+
+                // Build sorted list of accumulated tool calls.
+                let mut sorted_tcs: Vec<(i32, String, String, String, String)> = tool_acc
+                    .into_iter()
+                    .map(|(k, v)| (k, v.0, v.1, v.2, v.3))
+                    .collect();
+                sorted_tcs.sort_by_key(|e| e.0);
+
+                if sorted_tcs.is_empty() {
+                    return Ok(accumulated_text);
+                }
+
+                // Reconstruct assistant message with thought_signatures preserved.
+                let tool_calls_json: Vec<Value> = sorted_tcs
+                    .iter()
+                    .map(|(_, id, name, args, sig)| {
+                        let mut tc = serde_json::json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": args,
+                            }
+                        });
+                        if !sig.is_empty() {
+                            tc["extra_content"] =
+                                serde_json::json!({"google": {"thought_signature": sig}});
+                        }
+                        tc
+                    })
+                    .collect();
+
+                let mut asst_msg = serde_json::json!({
+                    "role": "assistant",
+                    "tool_calls": tool_calls_json,
+                });
+                if !accumulated_text.is_empty() {
+                    asst_msg["content"] = serde_json::json!(accumulated_text);
+                }
+                messages.push(asst_msg);
+
+                for (_, id, name, args, _) in &sorted_tcs {
+                    let tool_input: Value = serde_json::from_str(args)
+                        .unwrap_or(Value::Object(serde_json::Map::new()));
+                    let result_content = if let Some(tool) = self.find_tool(name) {
+                        let allowed =
+                            self.check_tool_permission(tool, &tool_input, &tx_ui).await?;
+                        if !allowed {
+                            format!("Permission denied for tool '{}'.", name)
+                        } else {
+                            let exec = tool.call(tool_input, ctx).await;
+                            if let Some(ref tx) = tx_ui {
+                                let _ = tx
+                                    .send(crate::ui::app::UiEvent::ToolFinished(name.clone()))
+                                    .await;
+                            }
+                            match exec {
+                                Ok(res) => serde_json::to_string(&res.output)
+                                    .unwrap_or_else(|_| "success".to_string()),
+                                Err(e) => format!("Error executing tool: {}", e),
+                            }
+                        }
+                    } else {
+                        format!("Error: Tool '{}' not found.", name)
+                    };
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": id,
+                        "content": result_content,
+                    }));
+                }
+
+                self.auto_save_session(&messages);
+            } else {
+                // ── Non-streaming path ───────────────────────────────────────
+                // Parse response as raw JSON to preserve thought_signature fields.
+                let resp_json: Value = response.json().await?;
+                let api_duration = api_start.elapsed().as_millis() as u64;
+
+                if let Some(usage) = resp_json.get("usage") {
+                    let inp = usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let out = usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cost = calculate_cost(&self.model, inp, out);
+                    if let Ok(mut tracker) = self.cost_tracker.lock() {
+                        tracker.add_usage(&self.model, inp, out, cost);
+                        tracker.total_api_duration_ms += api_duration;
+                    }
+                }
+
+                let message = resp_json
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .ok_or_else(|| anyhow!("No choices in Gemini response"))?
+                    .clone();
+
+                // Push raw message as assistant turn (preserves thought_signature).
+                let mut asst_msg = message.clone();
+                asst_msg["role"] = serde_json::json!("assistant");
+                messages.push(asst_msg);
+
+                let tool_calls = message
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .cloned();
+
+                if let Some(tool_calls_arr) = tool_calls {
+                    for tc in &tool_calls_arr {
+                        let call_id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let func_name = tc["function"]["name"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let func_args = tc["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or("{}")
+                            .to_string();
+
+                        let result_content = if let Some(tool) = self.find_tool(&func_name) {
+                            let args_val: Value = serde_json::from_str(&func_args)
+                                .unwrap_or(Value::Object(serde_json::Map::new()));
+                            let allowed =
+                                self.check_tool_permission(tool, &args_val, &tx_ui).await?;
+                            if !allowed {
+                                format!("Permission denied for tool '{}'.", func_name)
+                            } else {
+                                match tool.call(args_val, ctx).await {
+                                    Ok(res) => serde_json::to_string(&res.output)
+                                        .unwrap_or_else(|_| "success".to_string()),
+                                    Err(e) => format!("Error executing tool: {}", e),
+                                }
+                            }
+                        } else {
+                            format!("Error: Tool '{}' not found.", func_name)
+                        };
+
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": result_content,
+                        }));
+                    }
+                    self.auto_save_session(&messages);
+                } else {
+                    let text = message
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(text);
+                }
             }
         }
     }
@@ -1154,10 +1541,18 @@ static PRICING_TABLE: &[PricingEntry] = &[
     PricingEntry { primary: "gemini",      secondary: Some("flash"),      price: ModelPricing { input_per_mtok:  0.10, output_per_mtok:  0.40 } },
     PricingEntry { primary: "gemini",      secondary: None,               price: ModelPricing { input_per_mtok:  1.25, output_per_mtok: 10.00 } },
     // ── OpenAI ─────────────────────────────────────────────────────
-    PricingEntry { primary: "gpt-4o-mini", secondary: None,               price: ModelPricing { input_per_mtok:  0.15, output_per_mtok:  0.60 } },
-    PricingEntry { primary: "gpt-4o",      secondary: None,               price: ModelPricing { input_per_mtok:  2.50, output_per_mtok: 10.00 } },
-    PricingEntry { primary: "gpt-4",       secondary: None,               price: ModelPricing { input_per_mtok:  2.50, output_per_mtok: 10.00 } },
-    PricingEntry { primary: "gpt-3.5",     secondary: None,               price: ModelPricing { input_per_mtok:  0.50, output_per_mtok:  1.50 } },
+    PricingEntry { primary: "gpt-4.1-mini",  secondary: None, price: ModelPricing { input_per_mtok:  0.40, output_per_mtok:  1.60 } },
+    PricingEntry { primary: "gpt-4.1-nano",  secondary: None, price: ModelPricing { input_per_mtok:  0.10, output_per_mtok:  0.40 } },
+    PricingEntry { primary: "gpt-4.1",       secondary: None, price: ModelPricing { input_per_mtok:  2.00, output_per_mtok:  8.00 } },
+    PricingEntry { primary: "gpt-4o-mini",   secondary: None, price: ModelPricing { input_per_mtok:  0.15, output_per_mtok:  0.60 } },
+    PricingEntry { primary: "gpt-4o",        secondary: None, price: ModelPricing { input_per_mtok:  2.50, output_per_mtok: 10.00 } },
+    PricingEntry { primary: "gpt-4",         secondary: None, price: ModelPricing { input_per_mtok:  2.50, output_per_mtok: 10.00 } },
+    PricingEntry { primary: "gpt-3.5",       secondary: None, price: ModelPricing { input_per_mtok:  0.50, output_per_mtok:  1.50 } },
+    PricingEntry { primary: "o4-mini",       secondary: None, price: ModelPricing { input_per_mtok:  1.10, output_per_mtok:  4.40 } },
+    PricingEntry { primary: "o3-mini",       secondary: None, price: ModelPricing { input_per_mtok:  1.10, output_per_mtok:  4.40 } },
+    PricingEntry { primary: "o3",            secondary: None, price: ModelPricing { input_per_mtok: 10.00, output_per_mtok: 40.00 } },
+    PricingEntry { primary: "o1-mini",       secondary: None, price: ModelPricing { input_per_mtok:  1.10, output_per_mtok:  4.40 } },
+    PricingEntry { primary: "o1",            secondary: None, price: ModelPricing { input_per_mtok: 15.00, output_per_mtok: 60.00 } },
 ];
 
 /// Looks up the price for `model` by scanning [`PRICING_TABLE`].

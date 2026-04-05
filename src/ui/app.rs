@@ -3,24 +3,36 @@
 //! Three-zone layout: scrollable conversation, status line, and input prompt.
 //! Uses typed [`MessageEntry`] variants to render user, assistant, tool, and
 //! permission messages with the correct visual style.
+//!
+//! # Module layout
+//!
+//! The `App` implementation is split across several files for maintainability:
+//!
+//! | File                  | Responsibility                                |
+//! |-----------------------|-----------------------------------------------|
+//! | `app.rs` (this file)  | Types, state, constructor, main event loop    |
+//! | `app/render.rs`       | All rendering (conversation, status, prompt)  |
+//! | `app/autocomplete.rs` | Slash command and `@file` autocomplete        |
+//! | `app/commands_handler.rs` | Slash command parsing and dispatch         |
+//! | `app/dialog_handler.rs`   | Dialog open/close/result lifecycle        |
+//! | `app/history.rs`      | Input history up/down navigation              |
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, MouseEventKind};
-use ratatui::{
-    backend::Backend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Paragraph, Wrap},
-    Frame, Terminal,
-};
-use std::collections::HashSet;
+use ratatui::{backend::Backend, Terminal};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::commands::{CommandContext, CommandRegistry, CommandResult};
+use crate::commands::CommandRegistry;
 use crate::tools::ask_user::QuestionRequest;
+use crate::ui::dialogs::{ActiveDialog, Dialog, DialogAction};
+
+mod autocomplete;
+mod commands_handler;
+mod dialog_handler;
+mod history;
+mod render;
 
 // ── Claude Code style characters ─────────────────────────────────────────
 const ASSISTANT_PREFIX: &str = "  \u{23BF} "; // ⎿ (left square bracket extension)
@@ -34,6 +46,12 @@ const AUTOCOMPLETE_MAX_ITEMS: usize = 5;
 const FILE_SCAN_MAX: usize = 5000;
 const FILE_SUGGEST_DEBOUNCE: Duration = Duration::from_millis(50);
 
+/// Build the startup banner rendered at the beginning of a chat session.
+///
+/// # Returns
+///
+/// A `String` containing ASCII/Unicode banner text for the initial system line.
+/// If `ferris_says` fails, the function falls back to a simple crab label.
 fn welcome_art() -> String {
     use std::io::Write;
     let msg = "R U S T   A G E N T";
@@ -162,6 +180,10 @@ pub struct App {
     last_file_refresh: Option<Instant>,
     /// Cached workspace file index for file autocomplete.
     file_index: Option<Vec<String>>,
+    /// Currently active dialog overlay (if any).
+    active_dialog: ActiveDialog,
+    /// Boxed dialog widget for the current overlay.
+    dialog_widget: Option<Box<dyn Dialog>>,
 }
 
 struct PendingPermission {
@@ -177,6 +199,19 @@ struct PendingQuestion {
 }
 
 impl App {
+    /// Create a fresh `App` state used by the TUI runtime.
+    ///
+    /// # Parameters
+    ///
+    /// - `tx_to_engine`: Channel sender used to forward user prompts to the engine.
+    /// - `rx_from_engine`: Channel receiver used to collect UI events from the engine.
+    /// - `rx_questions`: Channel receiver for interactive AskUserQuestion prompts.
+    /// - `command_registry`: Registry containing all available slash commands.
+    ///
+    /// # Returns
+    ///
+    /// A fully initialized `App` with welcome text, loaded keybindings, and default
+    /// UI/autocomplete/history state.
     pub fn new(
         tx_to_engine: mpsc::Sender<String>,
         rx_from_engine: mpsc::Receiver<UiEvent>,
@@ -217,9 +252,26 @@ impl App {
             autocomplete_dirty: true,
             last_file_refresh: None,
             file_index: None,
+            active_dialog: ActiveDialog::None,
+            dialog_widget: None,
         }
     }
 
+    /// Run the main asynchronous TUI loop until exit is requested.
+    ///
+    /// # Parameters
+    ///
+    /// - `terminal`: Active ratatui terminal used to draw frames each tick.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(())`: The app exited cleanly.
+    /// - `Err(anyhow::Error)`: Terminal I/O or event polling failed.
+    ///
+    /// # Behavior
+    ///
+    /// This loop handles engine events, interactive questions, keyboard/mouse input,
+    /// message rendering state, autocomplete refresh, and graceful shutdown.
     pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
         while !self.exit {
             terminal.draw(|f| {
@@ -343,6 +395,23 @@ impl App {
                 self.frame_ticker = self.frame_ticker.wrapping_add(1);
                 match event::read()? {
                     Event::Key(key) => {
+                    // Dialog overlay intercept — route all keys to the active dialog.
+                    // When open, no other input handler runs.
+                    if let Some(ref mut widget) = self.dialog_widget {
+                        let action = widget.handle_key(key);
+                        match action {
+                            DialogAction::Continue => {}
+                            DialogAction::Select(value) => {
+                                self.handle_dialog_result(&value);
+                                self.close_dialog();
+                            }
+                            DialogAction::Cancel => {
+                                self.close_dialog();
+                            }
+                        }
+                        continue;
+                    }
+
                     // Question prompt intercept — send typed answer back to AskUserQuestionTool
                     if self.pending_question.is_some() {
                         if let KeyCode::Enter = key.code {
@@ -528,6 +597,12 @@ impl App {
         Ok(())
     }
 
+    /// Recompute conversation scroll offset when auto-follow mode is active.
+    ///
+    /// # Behavior
+    ///
+    /// Uses estimated wrapped line counts for message history plus stream buffer,
+    /// then pins the viewport to the bottom unless the user manually scrolled.
     fn auto_scroll(&mut self) {
         if self.user_scrolled {
             return;
@@ -542,7 +617,15 @@ impl App {
         self.scroll_offset = (total_lines + stream_lines).saturating_sub(visible) as u32;
     }
 
-    /// Count visual lines for a message, accounting for soft wrapping.
+    /// Estimate rendered line count for one message entry.
+    ///
+    /// # Parameters
+    ///
+    /// - `entry`: Message variant whose on-screen height should be computed.
+    ///
+    /// # Returns
+    ///
+    /// Number of visual lines after accounting for prefixes and soft wrapping.
     fn entry_line_count(&self, entry: &MessageEntry) -> usize {
         let w = self.term_width.saturating_sub(2) as usize; // same padding as render
         if w == 0 {
@@ -560,7 +643,16 @@ impl App {
         }
     }
 
-    /// Count visual lines after soft wrapping, given a prefix width.
+    /// Count wrapped visual lines for a text block with a fixed prefix width.
+    ///
+    /// # Parameters
+    ///
+    /// - `text`: Raw text that will be displayed.
+    /// - `prefix_len`: Prefix width added to each line before wrapping.
+    ///
+    /// # Returns
+    ///
+    /// Total number of visual lines required for the wrapped content.
     fn wrapped_line_count(&self, text: &str, prefix_len: usize) -> usize {
         let w = self.term_width.saturating_sub(2) as usize;
         if w == 0 {
@@ -578,738 +670,16 @@ impl App {
         count.max(1)
     }
 
-    fn handle_slash_command(&mut self, cmd: &str) {
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        let command_name = parts
-            .first()
-            .copied()
-            .unwrap_or("")
-            .trim_start_matches('/');
-        let args = if parts.len() > 1 {
-            parts[1..].join(" ")
-        } else {
-            String::new()
-        };
+    // NOTE: The following methods have been extracted to separate files:
+    //
+    //   handle_slash_command()           → app/commands_handler.rs
+    //   open_dialog(), close_dialog(),
+    //     handle_dialog_result()         → app/dialog_handler.rs
+    //   push_history_entry(),
+    //     reset_history_navigation(),
+    //     navigate_history_previous(),
+    //     navigate_history_next()        → app/history.rs
+    //   render methods (ui, etc.)        → app/render.rs
+    //   autocomplete methods             → app/autocomplete.rs
 
-        // Special case: /help needs access to the registry for listing commands.
-        if command_name == "help" {
-            let commands = self.command_registry.list();
-            let help_text = crate::commands::help::build_help_text(&commands);
-            self.messages.push(MessageEntry::System(help_text));
-            self.auto_scroll();
-            return;
-        }
-
-        if let Some(command) = self.command_registry.find(command_name) {
-            let ctx = CommandContext {
-                cost_tracker: self.cost_tracker.clone(),
-                cwd: std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            };
-
-            match command.execute(&args, &ctx) {
-                Ok(result) => match result {
-                    CommandResult::Text(text) => {
-                        self.messages.push(MessageEntry::System(text));
-                    }
-                    CommandResult::Clear => {
-                        self.messages.clear();
-                        self.scroll_offset = 0;
-                        self.messages.push(MessageEntry::System(
-                            "  Conversation cleared.".to_string(),
-                        ));
-                    }
-                    CommandResult::Exit => {
-                        self.exit = true;
-                    }
-                    CommandResult::Silent => {}
-                    CommandResult::Prompt(_prompt_cmd) => {
-                        // TODO: send prompt_cmd.content to engine with allowed_tools filter
-                        self.messages.push(MessageEntry::System(
-                            "  Prompt commands not yet wired to engine.".to_string(),
-                        ));
-                    }
-                },
-                Err(e) => {
-                    self.messages
-                        .push(MessageEntry::Error(format!("  Command error: {}", e)));
-                }
-            }
-        } else {
-            self.messages.push(MessageEntry::System(format!(
-                "  Unknown command: /{}",
-                command_name
-            )));
-        }
-        self.auto_scroll();
-    }
-
-    fn push_history_entry(&mut self, submitted: String) {
-        let is_duplicate = self
-            .input_history
-            .last()
-            .map(|s| s == &submitted)
-            .unwrap_or(false);
-        if !is_duplicate {
-            self.input_history.push(submitted);
-        }
-    }
-
-    fn reset_history_navigation(&mut self) {
-        self.history_cursor = None;
-        self.history_draft = None;
-    }
-
-    fn navigate_history_previous(&mut self) {
-        if self.input_history.is_empty() {
-            return;
-        }
-
-        let next_cursor = match self.history_cursor {
-            Some(idx) => idx.saturating_sub(1),
-            None => {
-                self.history_draft = Some(self.input.clone());
-                self.input_history.len() - 1
-            }
-        };
-
-        self.history_cursor = Some(next_cursor);
-        self.input = self.input_history[next_cursor].clone();
-    }
-
-    fn navigate_history_next(&mut self) {
-        let Some(idx) = self.history_cursor else {
-            return;
-        };
-
-        if idx + 1 < self.input_history.len() {
-            let next_idx = idx + 1;
-            self.history_cursor = Some(next_idx);
-            self.input = self.input_history[next_idx].clone();
-        } else {
-            self.history_cursor = None;
-            self.input = self.history_draft.take().unwrap_or_default();
-        }
-    }
-
-    fn is_autocomplete_visible(&self) -> bool {
-        self.pending_permission.is_none()
-            && self.pending_question.is_none()
-            && !self.autocomplete_items.is_empty()
-    }
-
-    fn mark_autocomplete_dirty(&mut self) {
-        self.autocomplete_dirty = true;
-        if self
-            .autocomplete_dismissed_input
-            .as_ref()
-            .map(|s| s != &self.input)
-            .unwrap_or(false)
-        {
-            self.autocomplete_dismissed_input = None;
-        }
-    }
-
-    fn clear_autocomplete(&mut self) {
-        self.autocomplete_items.clear();
-        self.autocomplete_selected = 0;
-        self.autocomplete_dismissed_input = None;
-        self.autocomplete_dirty = false;
-    }
-
-    fn maybe_refresh_autocomplete(&mut self) {
-        if !self.autocomplete_dirty {
-            return;
-        }
-
-        if self.pending_permission.is_some() || self.pending_question.is_some() {
-            self.autocomplete_items.clear();
-            self.autocomplete_selected = 0;
-            self.autocomplete_dirty = false;
-            return;
-        }
-
-        if self
-            .autocomplete_dismissed_input
-            .as_ref()
-            .map(|s| s == &self.input)
-            .unwrap_or(false)
-        {
-            self.autocomplete_items.clear();
-            self.autocomplete_selected = 0;
-            self.autocomplete_dirty = false;
-            return;
-        }
-
-        let mut next_items = self.build_command_suggestions();
-        if next_items.is_empty() {
-            if let Some(query) = self.extract_file_query() {
-                let is_debounced = self
-                    .last_file_refresh
-                    .map(|t| t.elapsed() < FILE_SUGGEST_DEBOUNCE)
-                    .unwrap_or(false);
-                if is_debounced {
-                    return;
-                }
-                next_items = self.build_file_suggestions(&query);
-                self.last_file_refresh = Some(Instant::now());
-            }
-        }
-
-        self.autocomplete_items = next_items;
-        if self.autocomplete_selected >= self.autocomplete_items.len() {
-            self.autocomplete_selected = 0;
-        }
-        self.autocomplete_dirty = false;
-    }
-
-    fn build_command_suggestions(&self) -> Vec<AutocompleteItem> {
-        let token = self.input.split_whitespace().next().unwrap_or("");
-        if !token.starts_with('/') {
-            return Vec::new();
-        }
-
-        let needle = token.trim_start_matches('/').to_lowercase();
-        let mut seen = HashSet::new();
-        let mut scored: Vec<(usize, String)> = Vec::new();
-
-        for command in self.command_registry.list() {
-            let mut names = vec![command.name().to_string()];
-            names.extend(command.aliases().into_iter().map(|alias| alias.to_string()));
-            for name in names {
-                if !seen.insert(name.clone()) {
-                    continue;
-                }
-                let lower = name.to_lowercase();
-                if needle.is_empty() || lower.contains(&needle) {
-                    let score = if lower.starts_with(&needle) { 0 } else { 1 };
-                    scored.push((score, name));
-                }
-            }
-        }
-
-        scored.sort_by(|a, b| a.cmp(b));
-        scored
-            .into_iter()
-            .take(AUTOCOMPLETE_MAX_ITEMS)
-            .map(|(_, name)| AutocompleteItem {
-                display: format!("/{}", name),
-                insert: format!("/{} ", name),
-                kind: AutocompleteKind::Command,
-            })
-            .collect()
-    }
-
-    fn extract_file_query(&self) -> Option<String> {
-        let token = self.input.split_whitespace().last()?;
-        if token.starts_with('@') {
-            Some(token.trim_start_matches('@').to_lowercase())
-        } else {
-            None
-        }
-    }
-
-    fn build_file_suggestions(&mut self, query: &str) -> Vec<AutocompleteItem> {
-        if self.file_index.is_none() {
-            self.file_index = Some(self.scan_workspace_files());
-        }
-
-        let files = self.file_index.clone().unwrap_or_default();
-        let mut scored: Vec<(usize, String)> = files
-            .into_iter()
-            .filter_map(|path| {
-                let lower = path.to_lowercase();
-                if query.is_empty() || lower.contains(query) {
-                    let score = if lower.starts_with(query) { 0 } else { 1 };
-                    Some((score, path))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        scored.sort_by(|a, b| a.cmp(b));
-        scored
-            .into_iter()
-            .take(AUTOCOMPLETE_MAX_ITEMS)
-            .map(|(_, path)| AutocompleteItem {
-                display: format!("@{}", path),
-                insert: format!("@{}", path),
-                kind: AutocompleteKind::File,
-            })
-            .collect()
-    }
-
-    fn scan_workspace_files(&self) -> Vec<String> {
-        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
-            if out.len() >= FILE_SCAN_MAX {
-                return;
-            }
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-
-            for entry in entries.flatten() {
-                if out.len() >= FILE_SCAN_MAX {
-                    return;
-                }
-                let path = entry.path();
-                let name = entry.file_name();
-                if let Some(name_str) = name.to_str() {
-                    if matches!(name_str, ".git" | "target" | "node_modules") {
-                        continue;
-                    }
-                }
-                if path.is_dir() {
-                    walk(&path, root, out);
-                } else if let Ok(rel) = path.strip_prefix(root) {
-                    out.push(rel.to_string_lossy().to_string());
-                }
-            }
-        }
-
-        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let mut out = Vec::new();
-        walk(&root, &root, &mut out);
-        out
-    }
-
-    fn accept_autocomplete(&mut self) {
-        if self.autocomplete_items.is_empty() {
-            return;
-        }
-
-        let idx = self
-            .autocomplete_selected
-            .min(self.autocomplete_items.len().saturating_sub(1));
-        let item = self.autocomplete_items[idx].clone();
-
-        match item.kind {
-            AutocompleteKind::Command => {
-                let mut parts = self.input.splitn(2, ' ');
-                let _ = parts.next();
-                if let Some(rest) = parts.next() {
-                    self.input = format!("{}{}", item.insert, rest.trim_start());
-                } else {
-                    self.input = item.insert;
-                }
-            }
-            AutocompleteKind::File => {
-                self.input = Self::replace_last_token(&self.input, &item.insert);
-            }
-        }
-
-        self.autocomplete_items.clear();
-        self.autocomplete_selected = 0;
-        self.autocomplete_dismissed_input = None;
-        self.autocomplete_dirty = true;
-    }
-
-    fn dismiss_autocomplete(&mut self) {
-        self.autocomplete_dismissed_input = Some(self.input.clone());
-        self.autocomplete_items.clear();
-        self.autocomplete_selected = 0;
-        self.autocomplete_dirty = false;
-    }
-
-    fn autocomplete_previous(&mut self) {
-        if self.autocomplete_items.is_empty() {
-            return;
-        }
-        if self.autocomplete_selected == 0 {
-            self.autocomplete_selected = self.autocomplete_items.len() - 1;
-        } else {
-            self.autocomplete_selected -= 1;
-        }
-    }
-
-    fn autocomplete_next(&mut self) {
-        if self.autocomplete_items.is_empty() {
-            return;
-        }
-        self.autocomplete_selected = (self.autocomplete_selected + 1) % self.autocomplete_items.len();
-    }
-
-    fn replace_last_token(input: &str, replacement: &str) -> String {
-        if let Some((idx, _)) = input.char_indices().rev().find(|(_, ch)| ch.is_whitespace()) {
-            let prefix = &input[..=idx];
-            format!("{}{}", prefix, replacement)
-        } else {
-            replacement.to_string()
-        }
-    }
-
-    // ── Rendering ────────────────────────────────────────────────────────
-
-    fn ui(&mut self, f: &mut Frame) {
-        let area = f.size();
-        self.term_width = area.width;
-
-        let autocomplete_height = if self.is_autocomplete_visible() {
-            self.autocomplete_items.len().min(AUTOCOMPLETE_MAX_ITEMS) as u16
-        } else {
-            0
-        };
-
-        // Layout: [conversation] [status line] [autocomplete] [prompt]
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(3),    // conversation
-                Constraint::Length(1), // status line
-                Constraint::Length(autocomplete_height), // autocomplete
-                Constraint::Length(1), // prompt input
-            ])
-            .split(area);
-
-        self.conv_height = chunks[0].height;
-        self.render_conversation(f, chunks[0]);
-        self.render_status_line(f, chunks[1]);
-        if autocomplete_height > 0 {
-            self.render_autocomplete(f, chunks[2]);
-        }
-        self.render_prompt(f, chunks[3]);
-    }
-
-    fn render_autocomplete(&self, f: &mut Frame, area: Rect) {
-        let mut lines: Vec<Line> = Vec::new();
-        for (idx, item) in self
-            .autocomplete_items
-            .iter()
-            .take(AUTOCOMPLETE_MAX_ITEMS)
-            .enumerate()
-        {
-            let selected = idx == self.autocomplete_selected;
-            let marker = if selected { "▶" } else { "·" };
-            let kind = match item.kind {
-                AutocompleteKind::Command => "CMD",
-                AutocompleteKind::File => "FILE",
-            };
-            let style = if selected {
-                Style::default().fg(Color::Black).bg(Color::LightCyan)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let kind_style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{} ", marker), style),
-                Span::styled(format!("{} ", kind), kind_style),
-                Span::styled(item.display.clone(), style),
-            ]));
-        }
-
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
-    }
-
-    fn render_conversation(&self, f: &mut Frame, area: Rect) {
-        let w = area.width.saturating_sub(2) as usize; // padding
-        let dim = Style::default().fg(Color::DarkGray);
-        let mut lines: Vec<Line> = Vec::new();
-
-        if self.scroll_offset == 0 {
-            let reveal = (self.frame_ticker / 2).min(HERO_TAGLINE.chars().count());
-            let tagline: String = HERO_TAGLINE.chars().take(reveal).collect();
-            let hero_rule: String = std::iter::repeat_n(
-                RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()],
-                w.min(56),
-            )
-            .collect();
-            lines.push(Line::from(vec![
-                Span::styled("  ✦ ", Style::default().fg(Color::LightCyan)),
-                Span::styled(
-                    HERO_TITLE,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  ", dim),
-                Span::styled(hero_rule, dim),
-            ]));
-            if !tagline.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("    ", dim),
-                    Span::styled(
-                        tagline,
-                        Style::default()
-                            .fg(Color::Gray)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ]));
-            }
-            lines.push(Line::from(Span::raw("")));
-        }
-
-        for entry in &self.messages {
-            match entry {
-                MessageEntry::User(text) => {
-                    for line in text.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("│ ", Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                format!("{} ", PROMPT_CHAR),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                line.to_string(),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    }
-                }
-                MessageEntry::Assistant(text) => {
-                    for (i, line) in text.lines().enumerate() {
-                        let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
-                        lines.push(Line::from(vec![
-                            Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-                            Span::raw(line.to_string()),
-                        ]));
-                    }
-                }
-                MessageEntry::ToolUse { name, done, error } => {
-                    if *error {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(DOT, Style::default().fg(Color::Red)),
-                            Span::raw(" "),
-                            Span::styled(name.clone(), Style::default().fg(Color::Red)),
-                        ]));
-                    } else if *done {
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(DOT, Style::default().fg(Color::Green)),
-                            Span::raw(" "),
-                            Span::styled(
-                                name.clone(),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    } else {
-                        let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(spinner.to_string(), Style::default().fg(Color::LightCyan)),
-                            Span::raw(" "),
-                            Span::styled(
-                                name.clone(),
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    }
-                }
-                MessageEntry::Error(text) => {
-                    for line in text.lines() {
-                        lines.push(Line::from(vec![
-                            Span::styled("│ ", Style::default().fg(Color::Red)),
-                            Span::styled(ASSISTANT_PREFIX.to_string(), dim),
-                            Span::styled(line.to_string(), Style::default().fg(Color::Red)),
-                        ]));
-                    }
-                }
-                MessageEntry::System(text) => {
-                    for line in text.lines() {
-                        lines.push(Line::from(Span::styled(line.to_string(), dim)));
-                    }
-                }
-                MessageEntry::Divider => {
-                    let divider_char = RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()];
-                    let divider: String = std::iter::repeat_n(divider_char, w.min(80)).collect();
-                    lines.push(Line::from(Span::styled(divider, Style::default().fg(Color::DarkGray))));
-                }
-                MessageEntry::Permission {
-                    tool_name,
-                    description,
-                } => {
-                    lines.push(Line::from(vec![
-                        Span::styled("  ", dim),
-                        Span::styled(
-                            tool_name.clone(),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!(" - {}", description),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ]));
-                    lines.push(Line::from(Span::styled(
-                        "  Allow? (y)es / (n)o / (a)lways",
-                        Style::default().fg(Color::Yellow),
-                    )));
-                }
-                MessageEntry::Question { question, .. } => {
-                    for line in question.lines() {
-                        lines.push(Line::from(Span::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::Cyan),
-                        )));
-                    }
-                }
-            }
-        }
-
-        // Thinking spinner
-        if self.waiting_for_response {
-            let spinner = SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()];
-            let thinking_dots = match self.frame_ticker % 3 {
-                0 => ".",
-                1 => "..",
-                _ => "...",
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {} ", spinner),
-                    Style::default().fg(Color::LightCyan),
-                ),
-                Span::styled(
-                    format!("Thinking{}", thinking_dots),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]));
-        }
-
-        // Streaming text
-        if let Some(ref stream) = self.current_stream {
-            if !stream.is_empty() {
-                for (i, line) in stream.lines().enumerate() {
-                    let prefix = if i == 0 { ASSISTANT_PREFIX } else { "    " };
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix.to_string(), dim),
-                        Span::raw(line.to_string()),
-                    ]));
-                }
-            } else {
-                // Empty stream — push a blank streaming line for the cursor
-                lines.push(Line::from(vec![
-                    Span::styled(ASSISTANT_PREFIX.to_string(), dim),
-                ]));
-            }
-            // Blinking cursor — always on the last streaming line
-            let cursor = if self.frame_ticker % 10 < 5 {
-                "\u{2588}" // full block
-            } else {
-                " "
-            };
-            if let Some(last) = lines.last_mut() {
-                last.spans.push(Span::styled(
-                    cursor.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-        }
-
-        let para = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((self.scroll_offset.min(u16::MAX as u32) as u16, 0));
-
-        f.render_widget(para, area);
-    }
-
-    fn render_status_line(&self, f: &mut Frame, area: Rect) {
-        let dim = Style::default().fg(Color::DarkGray);
-        let w = area.width as usize;
-
-        let pulse = if self.frame_ticker % 8 < 4 { "●" } else { "◌" };
-        let left_body = if let Some(ref tool) = self.running_tool {
-            format!("{} {}", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()], tool)
-        } else if self.current_stream.is_some() {
-            format!("{} streaming", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()])
-        } else if self.waiting_for_response {
-            format!("{} thinking", SPINNER_FRAMES[self.frame_ticker % SPINNER_FRAMES.len()])
-        } else {
-            "ready".to_string()
-        };
-        let left = format!(" {} rust-agent | {} ", pulse, left_body);
-
-        // Right: cost if available
-        let right = if let Some(ref tracker) = self.cost_tracker {
-            if let Ok(t) = tracker.lock() {
-                if t.total_cost_usd > 0.0 {
-                    format!("${:.4} ", t.total_cost_usd)
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-
-        let fill_len = w.saturating_sub(left.len() + right.len());
-        let rail_char = RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()];
-        let fill: String = std::iter::repeat_n(rail_char, fill_len).collect();
-
-        let line = Line::from(vec![
-            Span::styled(left, Style::default().fg(Color::Cyan)),
-            Span::styled(fill, dim),
-            Span::styled(right, Style::default().fg(Color::Green)),
-        ]);
-
-        f.render_widget(Paragraph::new(vec![line]), area);
-    }
-
-    fn render_prompt(&self, f: &mut Frame, area: Rect) {
-        if self.pending_permission.is_some() {
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{} ", PROMPT_CHAR),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    "Allow? (y)es / (n)o / (a)lways",
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]);
-            f.render_widget(Paragraph::new(vec![line]), area);
-        } else if self.pending_question.is_some() {
-            // Show user input with cyan prompt while answering a question
-            let cursor_vis = if self.frame_ticker % 10 < 5 { "\u{2588}" } else { " " };
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{} ", PROMPT_CHAR),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(self.input.clone()),
-                Span::styled(cursor_vis.to_string(), Style::default().fg(Color::DarkGray)),
-            ]);
-            f.render_widget(Paragraph::new(vec![line]), area);
-        } else {
-            let cursor_vis = if self.frame_ticker % 10 < 5 {
-                "\u{2588}" // full block cursor
-            } else {
-                " "
-            };
-
-            let prompt_glyph = if self.frame_ticker % 12 < 6 { "❯" } else { PROMPT_CHAR };
-
-            let line = Line::from(vec![
-                Span::styled(
-                    format!("{} ", prompt_glyph),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(self.input.clone()),
-                Span::styled(cursor_vis.to_string(), Style::default().fg(Color::DarkGray)),
-            ]);
-            f.render_widget(Paragraph::new(vec![line]), area);
-        }
-    }
 }

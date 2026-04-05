@@ -37,7 +37,7 @@ pub fn estimate_conversation_tokens(messages: &[serde_json::Value]) -> u64 {
 /// Sources:
 /// - Anthropic docs (2026-04): Opus 4.6, Sonnet 4.6 = 1M; others = 200k
 /// - Google AI pricing (2026-04): Gemini 2.5+ = 1M
-/// - OpenAI: GPT-4o = 128k
+/// - OpenAI: GPT-4.1 = 1M; GPT-4o / o-series = 128–200k
 pub fn get_context_window(model: &str) -> u64 {
     let m = model.to_lowercase();
     // Claude Opus 4.6 and Sonnet 4.6 have a 1M context window.
@@ -45,8 +45,12 @@ pub fn get_context_window(model: &str) -> u64 {
         1_000_000
     } else if m.contains("claude") {
         200_000
+    } else if m.contains("gpt-4.1") {
+        1_000_000
     } else if m.contains("gpt-4o") || m.contains("gpt-4") {
         128_000
+    } else if m.contains("o1") || m.contains("o3") || m.contains("o4") {
+        200_000
     } else if m.contains("gemini") {
         1_000_000
     } else {
@@ -88,6 +92,11 @@ mod tests {
         assert_eq!(get_context_window("claude-sonnet-4-6"), 1_000_000);
         assert_eq!(get_context_window("claude-sonnet-4-20250514"), 200_000);
         assert_eq!(get_context_window("gpt-4o"), 128_000);
+        assert_eq!(get_context_window("gpt-4.1"), 1_000_000);
+        assert_eq!(get_context_window("gpt-4.1-mini"), 1_000_000);
+        assert_eq!(get_context_window("o1"), 200_000);
+        assert_eq!(get_context_window("o3-mini"), 200_000);
+        assert_eq!(get_context_window("o4-mini"), 200_000);
         assert_eq!(get_context_window("gemini-2.5-pro"), 1_000_000);
         assert_eq!(get_context_window("unknown-model"), 128_000);
     }

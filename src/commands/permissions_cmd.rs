@@ -18,17 +18,18 @@ impl Command for PermissionsCommand {
     }
 
     fn execute(&self, _args: &str, _ctx: &CommandContext) -> anyhow::Result<CommandResult> {
-        let mut lines = Vec::new();
-        lines.push("  Permission Modes".to_string());
-        lines.push("  ----------------".to_string());
-        lines.push("  Available modes:".to_string());
-        lines.push("    default          Ask for everything except read-only tools in the cwd".to_string());
-        lines.push("    accept-edits     Auto-allow file writes within the working directory".to_string());
-        lines.push("    bypass           Auto-allow nearly all operations".to_string());
-        lines.push("    plan             Read-only mode: deny all destructive tools".to_string());
-        lines.push("    dont-ask         Non-interactive: convert all ask decisions to deny".to_string());
-        lines.push(String::new());
-        lines.push("  Set via CLI: --permission-mode <mode>".to_string());
+        let lines = vec![
+            "  Permission Modes".to_string(),
+            "  ----------------".to_string(),
+            "  Available modes:".to_string(),
+            "    default          Ask for everything except read-only tools in the cwd".to_string(),
+            "    accept-edits     Auto-allow file writes within the working directory".to_string(),
+            "    bypass           Auto-allow nearly all operations".to_string(),
+            "    plan             Read-only mode: deny all destructive tools".to_string(),
+            "    dont-ask         Non-interactive: convert all ask decisions to deny".to_string(),
+            String::new(),
+            "  Set via CLI: --permission-mode <mode>".to_string(),
+        ];
 
         Ok(CommandResult::Text(lines.join("\n")))
     }
