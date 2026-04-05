@@ -100,10 +100,10 @@ impl Tool for GrepTool {
         let file_type = input["type"].as_str();
         let glob_pattern = input["glob"].as_str();
 
-        let mut args = build_rg_args(
+        let mut args = build_rg_args(&RgConfig {
             output_mode, show_line_numbers, context_lines, before_lines,
             after_lines, case_insensitive, multiline, file_type, glob_pattern, pattern,
-        );
+        });
         args.push(search_path.clone());
 
         let output = tokio::process::Command::new("rg")
@@ -150,19 +150,25 @@ impl Tool for GrepTool {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Assembles the `rg` CLI argument vector from parsed tool input.
-fn build_rg_args(
-    output_mode: &str,
+/// Parsed arguments for assembling the `rg` CLI invocation.
+///
+/// Extracted from the tool input JSON so `build_rg_args` doesn't need
+/// 10+ positional parameters.
+struct RgConfig<'a> {
+    output_mode: &'a str,
     show_line_numbers: bool,
     context_lines: Option<u64>,
     before_lines: Option<u64>,
     after_lines: Option<u64>,
     case_insensitive: bool,
     multiline: bool,
-    file_type: Option<&str>,
-    glob_pattern: Option<&str>,
-    pattern: &str,
-) -> Vec<String> {
+    file_type: Option<&'a str>,
+    glob_pattern: Option<&'a str>,
+    pattern: &'a str,
+}
+
+/// Assembles the `rg` CLI argument vector from parsed tool input.
+fn build_rg_args(cfg: &RgConfig<'_>) -> Vec<String> {
     let mut args: Vec<String> = vec!["--hidden".to_string()];
 
     // Exclude VCS directories
@@ -173,38 +179,38 @@ fn build_rg_args(
     args.push("--max-columns".to_string());
     args.push("500".to_string());
 
-    match output_mode {
+    match cfg.output_mode {
         "files_with_matches" => args.push("-l".to_string()),
         "count" => args.push("-c".to_string()),
         "content" => {
-            if show_line_numbers { args.push("-n".to_string()); }
-            if let Some(ctx) = context_lines {
+            if cfg.show_line_numbers { args.push("-n".to_string()); }
+            if let Some(ctx) = cfg.context_lines {
                 args.push(format!("-C{}", ctx));
             } else {
-                if let Some(b) = before_lines { args.push(format!("-B{}", b)); }
-                if let Some(a) = after_lines { args.push(format!("-A{}", a)); }
+                if let Some(b) = cfg.before_lines { args.push(format!("-B{}", b)); }
+                if let Some(a) = cfg.after_lines { args.push(format!("-A{}", a)); }
             }
         }
         _ => args.push("-l".to_string()),
     }
 
-    if case_insensitive { args.push("-i".to_string()); }
-    if multiline {
+    if cfg.case_insensitive { args.push("-i".to_string()); }
+    if cfg.multiline {
         args.push("-U".to_string());
         args.push("--multiline-dotall".to_string());
     }
-    if let Some(ft) = file_type {
+    if let Some(ft) = cfg.file_type {
         args.push("--type".to_string());
         args.push(ft.to_string());
     }
-    if let Some(g) = glob_pattern {
+    if let Some(g) = cfg.glob_pattern {
         args.push("--glob".to_string());
         args.push(g.to_string());
     }
 
     // Escape patterns that look like flags
-    if pattern.starts_with('-') { args.push("-e".to_string()); }
-    args.push(pattern.to_string());
+    if cfg.pattern.starts_with('-') { args.push("-e".to_string()); }
+    args.push(cfg.pattern.to_string());
 
     args
 }

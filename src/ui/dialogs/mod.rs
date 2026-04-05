@@ -3,8 +3,27 @@
 //! Dialogs are rendered as centered overlays on top of the conversation.
 //! The TUI checks [`ActiveDialog`] each frame and routes key events
 //! to the active dialog instead of the normal input handler.
+//!
+//! # Available dialogs
+//!
+//! | Dialog          | Trigger      | Module              |
+//! |-----------------|--------------|---------------------|
+//! | Model picker    | `/model`     | [`model_picker`]    |
+//! | Theme picker    | `/theme`     | [`theme_picker`]    |
+//! | Settings editor | `/settings`  | [`settings_dialog`] |
+//!
+//! # Adding a new dialog
+//!
+//! 1. Create a new module (e.g., `my_dialog.rs`) implementing [`Dialog`].
+//! 2. Add a variant to [`ActiveDialog`].
+//! 3. Register the variant in `App::open_dialog()` (in `app/dialog_handler.rs`).
+//! 4. Handle the result in `App::handle_dialog_result()`.
 
+/// Model selection dialog — pick an LLM model grouped by provider.
 pub mod model_picker;
+/// Full settings editor — edit all config values with grouped categories.
+pub mod settings_dialog;
+/// Theme selection dialog — pick a color theme or output style.
 pub mod theme_picker;
 
 use ratatui::{
@@ -22,6 +41,8 @@ pub enum ActiveDialog {
     ModelPicker,
     /// Theme selection dialog.
     ThemePicker,
+    /// Full settings dialog.
+    Settings,
 }
 
 /// Common trait for dialog widgets.

@@ -209,7 +209,7 @@ pub fn parse_bindings(blocks: &[KeybindingBlock]) -> Vec<ParsedBinding> {
             let chord = parse_chord(key);
             let action = action_str
                 .as_ref()
-                .and_then(|s| KeybindingAction::from_str(s));
+                .and_then(|s| KeybindingAction::parse_action(s));
             bindings.push(ParsedBinding {
                 chord,
                 action,
