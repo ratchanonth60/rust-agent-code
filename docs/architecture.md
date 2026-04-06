@@ -79,10 +79,10 @@ src/
 ├── main.rs                         Entry point, CLI args, 3 execution modes
 │
 ├── auth/                           Authentication & credential management
-│   ├── mod.rs                      resolve_gemini_token() facade
+│   ├── mod.rs                      resolve_gemini_token() / resolve_claude_token() facade
 │   ├── credentials.rs              CredentialStore + TokenCredential (load/save)
-│   ├── oauth.rs                    PKCE generation, callback server, token exchange
-│   ├── client_config.rs            OAuthClientConfig (Google endpoints)
+│   ├── oauth.rs                    PKCE generation, callback server, token exchange (Gemini + Claude)
+│   ├── client_config.rs            OAuthClientConfig (Google) + AnthropicOAuthConfig (Claude)
 │   └── resolver.rs                 Auth chain: OAuth → env var → error
 │
 ├── engine/                         LLM query engine
@@ -285,20 +285,36 @@ This keeps the UI thread responsive while the engine runs async tool-use loops.
 
 ### Auth Fallback Chain
 
-Gemini authentication uses a priority chain with zero breaking changes:
+Both Gemini and Claude support OAuth2 login with a priority-based fallback:
 
 ```
-CredentialStore (OAuth2 token, auto-refresh if expired)
-  ↓ not found or refresh failed
-GEMINI_API_KEY env var
-  ↓ not found
-Error with helpful message
+Gemini:
+  CredentialStore (OAuth2 token, auto-refresh if expired)
+    ↓ not found or refresh failed
+  GEMINI_API_KEY env var
+    ↓ not found
+  Error with helpful message
+
+Claude:
+  CredentialStore (OAuth2 token, auto-refresh if expired)
+    ↓ not found or refresh failed
+  ANTHROPIC_API_KEY env var
+    ↓ not found
+  Error with helpful message
 ```
 
-OAuth uses **Authorization Code + PKCE (S256)** with a localhost callback server.
-Credentials are stored in `~/.rust-agent/credentials.json` (chmod 600). The flow
-opens the user's browser, Google redirects to `http://127.0.0.1:<random-port>/`,
-and the agent exchanges the code for tokens.
+**Gemini OAuth** uses Google Authorization Code + PKCE (S256) with form-encoded token
+exchange. The flow opens the user's browser, Google redirects to
+`http://127.0.0.1:<random-port>/`, and the agent exchanges the code for tokens.
+
+**Claude OAuth** uses Anthropic Authorization Code + PKCE (S256) with JSON token
+exchange (no `client_secret`). The browser opens `platform.claude.com/oauth/authorize`,
+Anthropic redirects to `http://localhost:<random-port>/callback`, and the agent
+exchanges the code for tokens. API requests using Claude OAuth include the
+`anthropic-beta: oauth-2025-04-20` header alongside `Authorization: Bearer`.
+
+Credentials are stored in `~/.rust-agent/credentials.json` (chmod 600). Both providers
+share the same `CredentialStore` and `TokenCredential` types.
 
 ### Session JSONL Format
 

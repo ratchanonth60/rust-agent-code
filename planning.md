@@ -20,7 +20,7 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
                 │     └── Markdown + syntax highlighting + diff viewer
                 ├──→ Bare mode (stdin/stdout, no TUI)
                 ├──→ Context System (CLAUDE.md, git status, system prompt)
-                ├──→ Auth System (Google OAuth2 + PKCE, credential store, env var fallback)
+                ├──→ Auth System (Google OAuth2 + Anthropic OAuth2, PKCE, credential store, env var fallback)
                 ├──→ Permission System (5 modes, path safety, session rules)
                 ├──→ Cost Tracker (token usage, $/model, budget enforcement)
                 ├──→ Session Persistence (JSONL append-only, project-scoped, compact boundaries)
@@ -121,7 +121,7 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 ### Phase 8: Advanced (Future) 🔲
 
 - [ ] **8.1** Parallel tool execution for OpenAI/Gemini providers
-- [x] **8.2** OAuth / API key management (`/login`, `/logout`, `/auth-status`) — Google OAuth2 + PKCE for Gemini
+- [x] **8.2** OAuth / API key management (`/login`, `/logout`, `/auth-status`) — Google OAuth2 + PKCE for Gemini, Anthropic OAuth2 + PKCE for Claude
 - [x] **8.2b** Session JSONL upgrade — append-only, project-scoped, crash-safe with compact boundaries
 - [ ] **8.3** GitHub integration (`/pr`, `/issue`, PR review automation)
 - [ ] **8.4** IDE bridge (VS Code extension integration)
@@ -150,7 +150,7 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 | Plugins | Full | Full | 100% |
 | Skills | Full | Full | 100% |
 | TUI | React/Ink | ratatui | ~90% |
-| OAuth | Yes | Gemini (Google OAuth2 + PKCE) | ~33% |
+| OAuth | Yes | Gemini (Google) + Claude (Anthropic), both PKCE | ~67% |
 | IDE Bridge | Yes | No | 0% |
 | Coordinator | Yes | No | 0% |
 | Voice | Yes | No | 0% |
@@ -166,7 +166,7 @@ src/
   main.rs                           # CLI + 3 modes (one-shot, bare, TUI)
   auth/
     mod.rs, credentials.rs          # OAuth credential store + token management
-    oauth.rs, client_config.rs      # PKCE flow, localhost callback, token exchange
+    oauth.rs, client_config.rs      # PKCE flow, callback, token exchange (Gemini + Claude)
   engine/
     mod.rs, config.rs, query.rs     # Core engine + agentic loop
     streaming.rs, tokens.rs         # SSE parser + token estimation
