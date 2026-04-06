@@ -30,8 +30,15 @@ use crate::engine::query::QueryEngine;
 use crate::tools::ToolContext;
 
 impl QueryEngine {
-    /// Resolves the Gemini API key from environment variables.
+    /// Resolves the Gemini API key / OAuth token.
+    ///
+    /// Priority: OAuth credentials → `GEMINI_API_KEY` → `LLM_API_KEY`.
     pub(crate) fn get_gemini_key(&self) -> String {
+        // 1. Try OAuth token from ~/.rust-agent/credentials.json.
+        if let Ok(Some(token)) = crate::auth::resolve_gemini_token() {
+            return token;
+        }
+        // 2. Fallback to environment variables (existing behaviour).
         std::env::var("GEMINI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .unwrap_or_default()

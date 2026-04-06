@@ -53,14 +53,16 @@ const FILE_SUGGEST_DEBOUNCE: Duration = Duration::from_millis(50);
 /// A `String` containing ASCII/Unicode banner text for the initial system line.
 /// If `ferris_says` fails, the function falls back to a simple crab label.
 fn welcome_art() -> String {
-    use std::io::Write;
-    let msg = "R U S T   A G E N T";
-    let width = msg.len() + 4; // padding inside the speech bubble
-    let mut buf = Vec::new();
-    ferris_says::say(msg, width, &mut buf).unwrap_or_else(|_| {
-        let _ = write!(buf, "🦀 Rust Agent 🦀");
-    });
-    String::from_utf8_lossy(&buf).to_string()
+    let logo = r#"
+██████╗ ██╗   ██╗███████╗████████╗     █████╗  ██████╗ ███████╗███╗   ██╗████████╗
+██╔══██╗██║   ██║██╔════╝╚══██╔══╝    ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝
+██████╔╝██║   ██║███████╗   ██║       ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║   
+██╔══██╗██║   ██║╚════██║   ██║       ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║   
+██║  ██║╚██████╔╝███████║   ██║       ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║   
+╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝       ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   
+    "#;
+    
+    logo.to_string()
 }
 
 /// Events sent from the engine background task to the TUI for rendering.
@@ -186,6 +188,10 @@ pub struct App {
     active_dialog: ActiveDialog,
     /// Boxed dialog widget for the current overlay.
     dialog_widget: Option<Box<dyn Dialog>>,
+    /// Active model name displayed in the status line.
+    pub model_name: Option<String>,
+    /// Active provider label displayed in the status line.
+    pub provider_name: Option<String>,
 }
 
 struct PendingPermission {
@@ -257,6 +263,8 @@ impl App {
             file_index: None,
             active_dialog: ActiveDialog::None,
             dialog_widget: None,
+            model_name: None,
+            provider_name: None,
         }
     }
 

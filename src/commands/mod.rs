@@ -6,6 +6,11 @@
 pub mod types;
 pub mod registry;
 
+// ── Auth ────────────────────────────────────────────────────────────────
+pub mod auth_status;
+pub mod login;
+pub mod logout;
+
 // ── Local commands ──────────────────────────────────────────────────────
 pub mod branch;
 pub mod clear;
@@ -45,6 +50,11 @@ pub use types::{Command, CommandContext, CommandResult, CommandType, PromptComma
 /// Build a registry with all built-in commands pre-registered.
 pub fn build_default_registry() -> CommandRegistry {
     let mut reg = CommandRegistry::new();
+
+    // Auth
+    reg.register(Box::new(auth_status::AuthStatusCommand));
+    reg.register(Box::new(login::LoginCommand));
+    reg.register(Box::new(logout::LogoutCommand));
 
     // Core
     reg.register(Box::new(help::HelpCommand));

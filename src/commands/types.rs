@@ -23,6 +23,13 @@ pub enum CommandResult {
     Exit,
     /// Clear the conversation.
     Clear,
+    /// Resume a session — carries (session_id, messages) to be restored.
+    ResumeSession {
+        session_id: String,
+        messages: Vec<serde_json::Value>,
+        model: String,
+        provider: String,
+    },
 }
 
 /// A prompt-type command result with the prompt content and optional tool restrictions.

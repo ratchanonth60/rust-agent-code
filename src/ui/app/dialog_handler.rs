@@ -49,6 +49,12 @@ impl App {
             ActiveDialog::Settings => {
                 Box::new(crate::ui::dialogs::settings_dialog::SettingsDialog::new())
             }
+            ActiveDialog::SessionPicker => {
+                Box::new(crate::ui::dialogs::session_picker::SessionPickerDialog::new())
+            }
+            ActiveDialog::ApiKeySetup(provider) => {
+                Box::new(crate::ui::dialogs::api_key_setup::ApiKeySetupDialog::new(*provider))
+            }
         };
         self.active_dialog = dialog;
         self.dialog_widget = Some(widget);
@@ -97,6 +103,28 @@ impl App {
                     self.messages
                         .push(MessageEntry::System("  Settings saved.".to_string()));
                 }
+            }
+            ActiveDialog::SessionPicker => {
+                // `value` is the full session ID — load and resume
+                match crate::engine::session::Session::load(value) {
+                    Ok(session) => {
+                        self.apply_resume_session(
+                            session.id,
+                            session.messages,
+                            session.model,
+                            session.provider,
+                        );
+                    }
+                    Err(e) => {
+                        self.messages.push(MessageEntry::Error(format!(
+                            "  Failed to load session: {}",
+                            e
+                        )));
+                    }
+                }
+            }
+            ActiveDialog::ApiKeySetup(_) => {
+                // Handled externally via run_setup_flow(), not through normal dialog dispatch.
             }
             ActiveDialog::None => {}
         }
