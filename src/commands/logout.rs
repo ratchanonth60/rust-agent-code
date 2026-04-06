@@ -51,8 +51,23 @@ impl Command for LogoutCommand {
                     ))
                 }
             }
+            "claude" | "anthropic" => {
+                let mut store = crate::auth::credentials::CredentialStore::load()?;
+                if store.get_token("claude").is_some() {
+                    // No revocation endpoint for Anthropic — just remove local token.
+                    store.remove_token("claude");
+                    store.save()?;
+                    Ok(CommandResult::Text(
+                        "  Logged out from Claude. OAuth credentials removed.".to_string(),
+                    ))
+                } else {
+                    Ok(CommandResult::Text(
+                        "  No Claude OAuth credentials found.".to_string(),
+                    ))
+                }
+            }
             _ => Ok(CommandResult::Text(format!(
-                "  Unknown provider: '{provider}'\n  Supported: gemini"
+                "  Unknown provider: '{provider}'\n  Supported: gemini, claude"
             ))),
         }
     }

@@ -123,13 +123,21 @@ struct ClaudeUsage {
 // ── QueryEngine methods for Claude ─────────────────────────────────
 
 impl QueryEngine {
-    /// Resolves the Anthropic API key from environment variables.
+    /// Resolves authentication for the Anthropic API.
     ///
-    /// Checks `ANTHROPIC_API_KEY` first, then falls back to `CLAUDE_API_KEY`.
-    pub(crate) fn get_claude_key(&self) -> String {
-        std::env::var("ANTHROPIC_API_KEY")
+    /// Returns `(token_or_key, is_oauth)`. When `is_oauth` is true, the caller
+    /// should use `Authorization: Bearer` + `anthropic-beta` header instead of
+    /// the `x-api-key` header.
+    pub(crate) fn get_claude_auth(&self) -> (String, bool) {
+        // 1. OAuth token (from credentials.json) takes priority.
+        if let Ok(Some(token)) = crate::auth::resolve_claude_token() {
+            return (token, true);
+        }
+        // 2. Fall back to API key env vars.
+        let key = std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("CLAUDE_API_KEY"))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (key, false)
     }
 
     /// Returns the Anthropic API base URL.
@@ -171,10 +179,11 @@ impl QueryEngine {
         tx_ui: Option<tokio::sync::mpsc::Sender<crate::ui::app::UiEvent>>,
         context_window: u64,
     ) -> Result<String> {
-        let api_key = self.get_claude_key();
-        if api_key.is_empty() {
+        let (auth_value, is_oauth) = self.get_claude_auth();
+        if auth_value.is_empty() {
             return Err(anyhow!(
-                "ANTHROPIC_API_KEY (or CLAUDE_API_KEY) is required for Claude provider"
+                "No Claude authentication available.\n  \
+                 Set ANTHROPIC_API_KEY or run /login claude for OAuth."
             ));
         }
 
@@ -228,7 +237,18 @@ impl QueryEngine {
 
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            headers.insert("x-api-key", HeaderValue::from_str(&api_key)?);
+            if is_oauth {
+                headers.insert(
+                    "Authorization",
+                    HeaderValue::from_str(&format!("Bearer {}", auth_value))?,
+                );
+                headers.insert(
+                    "anthropic-beta",
+                    HeaderValue::from_static(crate::auth::claude_oauth_beta_header()),
+                );
+            } else {
+                headers.insert("x-api-key", HeaderValue::from_str(&auth_value)?);
+            }
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
             let endpoint = format!("{}/v1/messages", api_base.trim_end_matches('/'));

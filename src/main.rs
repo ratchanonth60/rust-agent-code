@@ -416,13 +416,21 @@ async fn run_setup_flow(provider: ModelProvider) -> SetupResult {
                     }
                     // Fallback: no provider tag, treat entire rest as key
                     return SetupResult::ApiKey(provider, rest.to_string());
-                } else if value.starts_with("oauth:") {
+                } else if let Some(oauth_provider) = value.strip_prefix("oauth:") {
                     // Run OAuth flow in normal terminal (browser-based)
                     eprintln!("  Starting OAuth login...");
-                    match crate::auth::oauth::run_oauth_flow("gemini").await {
+                    match crate::auth::oauth::run_oauth_flow(oauth_provider).await {
                         Ok(()) => {
                             // Verify token is now available
-                            if crate::auth::resolve_gemini_token().ok().flatten().is_some() {
+                            let token_ok = match oauth_provider {
+                                "claude" | "anthropic" => {
+                                    crate::auth::resolve_claude_token().ok().flatten().is_some()
+                                }
+                                _ => {
+                                    crate::auth::resolve_gemini_token().ok().flatten().is_some()
+                                }
+                            };
+                            if token_ok {
                                 eprintln!("  Login successful!");
                                 return SetupResult::OAuthDone;
                             }

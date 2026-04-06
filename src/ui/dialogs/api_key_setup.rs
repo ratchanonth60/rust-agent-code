@@ -28,7 +28,7 @@ enum SetupFocus {
     ProviderSelector,
     /// User is typing an API key.
     ApiKeyInput,
-    /// User is hovering the OAuth login button (Gemini only).
+    /// User is hovering the OAuth login button (Gemini / Claude).
     OAuthButton,
 }
 
@@ -69,7 +69,7 @@ impl ApiKeySetupDialog {
 
     /// Whether the current provider supports OAuth.
     fn has_oauth(&self) -> bool {
-        matches!(self.provider(), ModelProvider::Gemini)
+        matches!(self.provider(), ModelProvider::Gemini | ModelProvider::Claude)
     }
 }
 
@@ -156,7 +156,8 @@ impl Dialog for ApiKeySetupDialog {
                     }
                 }
                 SetupFocus::OAuthButton => {
-                    DialogAction::Select("oauth:gemini".to_string())
+                    let tag = provider_tag(self.provider());
+                    DialogAction::Select(format!("oauth:{}", tag))
                 }
             },
 
@@ -271,10 +272,15 @@ impl Dialog for ApiKeySetupDialog {
             lines.push(Line::from(""));
         }
 
-        // OAuth section (Gemini only)
+        // OAuth section (providers with OAuth support)
         if self.has_oauth() {
+            let oauth_label = match self.provider() {
+                ModelProvider::Gemini => "  Or authenticate with Google:",
+                ModelProvider::Claude => "  Or authenticate with Anthropic:",
+                _ => "  Or authenticate via OAuth:",
+            };
             lines.push(Line::from(Span::styled(
-                "  Or authenticate with Google:",
+                oauth_label,
                 Style::default().fg(Color::DarkGray),
             )));
             let oauth_style = if oauth_focused {

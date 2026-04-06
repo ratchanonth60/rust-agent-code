@@ -10,7 +10,7 @@ impl Command for LoginCommand {
     }
 
     fn description(&self) -> &str {
-        "Authenticate with a provider (Google OAuth2)"
+        "Authenticate with a provider via OAuth2"
     }
 
     fn aliases(&self) -> Vec<&str> {
@@ -45,8 +45,23 @@ impl Command for LoginCommand {
                     Err(e) => Ok(CommandResult::Text(format!("  Login failed: {e}"))),
                 }
             }
+            "claude" | "anthropic" => {
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(crate::auth::oauth::run_oauth_flow("claude"))
+                });
+
+                match result {
+                    Ok(()) => Ok(CommandResult::Text(
+                        "  Logged in to Claude.\n  \
+                         OAuth token saved to ~/.rust-agent/credentials.json"
+                            .to_string(),
+                    )),
+                    Err(e) => Ok(CommandResult::Text(format!("  Login failed: {e}"))),
+                }
+            }
             _ => Ok(CommandResult::Text(format!(
-                "  Unknown provider: '{provider}'\n  Supported: gemini"
+                "  Unknown provider: '{provider}'\n  Supported: gemini, claude"
             ))),
         }
     }

@@ -63,6 +63,10 @@ pub fn resolve_api_key(provider: ModelProvider, api_key_override: Option<&str>) 
     }
     let key = match provider {
         ModelProvider::Claude => {
+            // OAuth first, then env vars
+            if let Ok(Some(token)) = crate::auth::resolve_claude_token() {
+                return Some(token);
+            }
             std::env::var("ANTHROPIC_API_KEY")
                 .or_else(|_| std::env::var("CLAUDE_API_KEY"))
                 .unwrap_or_default()

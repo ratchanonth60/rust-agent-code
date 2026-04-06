@@ -1,8 +1,8 @@
-//! OAuth2 Authorization Code + PKCE flow for Google / Gemini.
+//! OAuth2 Authorization Code + PKCE flow for Google / Gemini and Anthropic / Claude.
 //!
 //! Implements the full browser-based login flow:
 //! 1. Generate PKCE challenge
-//! 2. Open browser to Google consent screen
+//! 2. Open browser to consent screen
 //! 3. Listen on localhost for the redirect callback
 //! 4. Exchange authorization code for tokens
 //! 5. Save tokens to credential store
@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::auth::client_config::{self, OAuthClientConfig};
+use crate::auth::client_config::{self, AnthropicOAuthConfig, OAuthClientConfig};
 use crate::auth::credentials::{CredentialStore, TokenCredential};
 
 // ── PKCE ─────────────────────────────────────────────────────────────
@@ -306,16 +306,164 @@ pub async fn revoke_token(config: &OAuthClientConfig, token: &str) -> Result<()>
     Ok(())
 }
 
+// ── Anthropic / Claude OAuth ────────────────────────────────────────
+
+/// Build the Anthropic OAuth2 authorization URL.
+///
+/// Differs from Google: no `access_type`, no `prompt`, uses `/callback`
+/// redirect path, and includes `code=true` for Claude Max upsell page.
+pub fn build_claude_authorization_url(
+    config: &AnthropicOAuthConfig,
+    redirect_port: u16,
+    pkce: &PkceChallenge,
+    state: &str,
+) -> String {
+    let redirect_uri = format!("http://localhost:{redirect_port}/callback");
+    let scopes = config.scopes.join(" ");
+
+    format!(
+        "{}?code=true&client_id={}&response_type=code&redirect_uri={}&scope={}&\
+         code_challenge={}&code_challenge_method=S256&state={}",
+        config.authorize_url,
+        percent_encode(&config.client_id),
+        percent_encode(&redirect_uri),
+        percent_encode(&scopes),
+        percent_encode(&pkce.code_challenge),
+        percent_encode(state),
+    )
+}
+
+/// Exchange an authorization code for tokens (Anthropic).
+///
+/// Uses JSON body (not form-encoded) and no `client_secret`.
+pub async fn exchange_claude_code(
+    config: &AnthropicOAuthConfig,
+    code: &str,
+    code_verifier: &str,
+    redirect_port: u16,
+    state: &str,
+) -> Result<TokenCredential> {
+    let client = reqwest::Client::new();
+    let redirect_uri = format!("http://localhost:{redirect_port}/callback");
+
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "client_id": config.client_id,
+        "code_verifier": code_verifier,
+        "state": state,
+    });
+
+    let resp = client
+        .post(&config.token_url)
+        .json(&body)
+        .send()
+        .await
+        .context("Claude token exchange request failed")?;
+
+    let status = resp.status();
+    let resp_body = resp.text().await.context("Failed to read token response")?;
+
+    if !status.is_success() {
+        if let Ok(err) = serde_json::from_str::<TokenErrorResponse>(&resp_body) {
+            return Err(anyhow!(
+                "Token exchange failed: {} — {}",
+                err.error,
+                err.error_description.unwrap_or_default()
+            ));
+        }
+        return Err(anyhow!("Token exchange failed (HTTP {status}): {resp_body}"));
+    }
+
+    let token: TokenResponse = serde_json::from_str(&resp_body)
+        .context("Failed to parse token response")?;
+
+    let now = now_secs();
+    let scopes = token
+        .scope
+        .map(|s| s.split(' ').map(String::from).collect())
+        .unwrap_or_default();
+
+    Ok(TokenCredential {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token.unwrap_or_default(),
+        expires_at: now + token.expires_in,
+        provider: "claude".into(),
+        scopes,
+    })
+}
+
+/// Refresh an access token using a refresh token (Anthropic).
+///
+/// Uses JSON body, no `client_secret`.
+pub async fn refresh_claude_token(
+    config: &AnthropicOAuthConfig,
+    refresh_token: &str,
+) -> Result<TokenCredential> {
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": config.client_id,
+    });
+
+    let resp = client
+        .post(&config.token_url)
+        .json(&body)
+        .send()
+        .await
+        .context("Claude token refresh request failed")?;
+
+    let status = resp.status();
+    let resp_body = resp.text().await.context("Failed to read refresh response")?;
+
+    if !status.is_success() {
+        if let Ok(err) = serde_json::from_str::<TokenErrorResponse>(&resp_body) {
+            return Err(anyhow!(
+                "Token refresh failed: {} — {}",
+                err.error,
+                err.error_description.unwrap_or_default()
+            ));
+        }
+        return Err(anyhow!("Token refresh failed (HTTP {status}): {resp_body}"));
+    }
+
+    let token: TokenResponse = serde_json::from_str(&resp_body)
+        .context("Failed to parse refresh response")?;
+
+    let now = now_secs();
+    Ok(TokenCredential {
+        access_token: token.access_token,
+        refresh_token: token
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string()),
+        expires_at: now + token.expires_in,
+        provider: "claude".into(),
+        scopes: token
+            .scope
+            .map(|s| s.split(' ').map(String::from).collect())
+            .unwrap_or_default(),
+    })
+}
+
 // ── High-level orchestrator ──────────────────────────────────────────
 
 /// Run the full OAuth2 login flow for a provider.
 ///
 /// Opens the browser, waits for callback, exchanges code, saves tokens.
 pub async fn run_oauth_flow(provider: &str) -> Result<()> {
-    let config = match provider {
-        "gemini" | "google" => client_config::load_gemini_config(),
-        _ => return Err(anyhow!("Unsupported OAuth provider: {provider}")),
-    };
+    match provider {
+        "gemini" | "google" => run_gemini_oauth_flow(provider).await,
+        "claude" | "anthropic" => run_claude_oauth_flow().await,
+        _ => Err(anyhow!("Unsupported OAuth provider: {provider}\n  Supported: gemini, claude")),
+    }
+}
+
+/// Gemini (Google) OAuth flow.
+async fn run_gemini_oauth_flow(provider: &str) -> Result<()> {
+    let config = client_config::load_gemini_config();
 
     // Check for placeholder credentials.
     if client_config::is_placeholder_config(&config) {
@@ -330,14 +478,9 @@ pub async fn run_oauth_flow(provider: &str) -> Result<()> {
         ));
     }
 
-    // 1. Generate PKCE challenge.
     let pkce = generate_pkce();
     let state = uuid::Uuid::new_v4().to_string();
-
-    // 2. Start callback server.
     let (listener, port) = start_callback_server().await?;
-
-    // 3. Build authorization URL and open browser.
     let auth_url = build_authorization_url(&config, port, &pkce, &state);
 
     eprintln!("  Opening browser for Google login...");
@@ -347,16 +490,39 @@ pub async fn run_oauth_flow(provider: &str) -> Result<()> {
         eprintln!("  {auth_url}");
     }
 
-    // 4. Wait for callback (120s timeout).
     let code = wait_for_callback(listener, &state, 120).await?;
-
-    // 5. Exchange code for tokens.
     let credential = exchange_code(&config, &code, &pkce.code_verifier, port).await?;
     info!(provider, "OAuth token obtained successfully");
 
-    // 6. Save to credential store.
     let mut store = CredentialStore::load()?;
     store.set_token(provider, credential);
+    store.save()?;
+
+    Ok(())
+}
+
+/// Claude (Anthropic) OAuth flow.
+async fn run_claude_oauth_flow() -> Result<()> {
+    let config = client_config::load_claude_config();
+
+    let pkce = generate_pkce();
+    let state = uuid::Uuid::new_v4().to_string();
+    let (listener, port) = start_callback_server().await?;
+    let auth_url = build_claude_authorization_url(&config, port, &pkce, &state);
+
+    eprintln!("  Opening browser for Anthropic login...");
+    if let Err(e) = open_browser(&auth_url) {
+        eprintln!("  Could not open browser: {e}");
+        eprintln!("  Please open this URL manually:");
+        eprintln!("  {auth_url}");
+    }
+
+    let code = wait_for_callback(listener, &state, 120).await?;
+    let credential = exchange_claude_code(&config, &code, &pkce.code_verifier, port, &state).await?;
+    info!("Claude OAuth token obtained successfully");
+
+    let mut store = CredentialStore::load()?;
+    store.set_token("claude", credential);
     store.save()?;
 
     Ok(())
@@ -491,5 +657,24 @@ mod tests {
         let encoded = percent_encode(original);
         let decoded = percent_decode(&encoded);
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn claude_authorization_url_format() {
+        let config = client_config::default_claude_config();
+        let pkce = PkceChallenge {
+            code_verifier: "test_verifier".into(),
+            code_challenge: "test_challenge".into(),
+        };
+        let url = build_claude_authorization_url(&config, 9090, &pkce, "mystate");
+        assert!(url.starts_with("https://platform.claude.com/oauth/authorize"));
+        assert!(url.contains("client_id=9d1c250a"));
+        assert!(url.contains("code_challenge=test_challenge"));
+        assert!(url.contains("state=mystate"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A9090%2Fcallback"));
+        assert!(url.contains("code=true"));
+        // Must NOT have Google-specific params
+        assert!(!url.contains("access_type="));
+        assert!(!url.contains("prompt="));
     }
 }

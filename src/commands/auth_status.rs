@@ -44,6 +44,20 @@ impl Command for AuthStatusCommand {
             lines.push("  [miss] Gemini OAuth: not configured (use /login gemini)".to_string());
         }
 
+        if let Some(cred) = store.get_token("claude") {
+            let status = if cred.is_expired() {
+                "expired"
+            } else if cred.needs_refresh() {
+                "refresh"
+            } else {
+                "active"
+            };
+            let masked = mask_token(&cred.access_token);
+            lines.push(format!("  [{status}] Claude OAuth: {masked}"));
+        } else {
+            lines.push("  [miss] Claude OAuth: not configured (use /login claude)".to_string());
+        }
+
         // Env var fallbacks
         lines.push(String::new());
         lines.push("  Environment Variables".to_string());
