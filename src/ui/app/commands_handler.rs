@@ -111,6 +111,68 @@ impl App {
                             "  Prompt commands not yet wired to engine.".to_string(),
                         ));
                     }
+                    CommandResult::ResumeSession {
+                        session_id,
+                        messages,
+                        model,
+                        provider,
+                    } => {
+                        let msg_count = messages.len();
+                        self.messages.clear();
+                        self.scroll_offset = 0;
+
+                        // Display recent conversation context in TUI
+                        let recent: Vec<_> = messages.iter().rev().take(6).collect();
+                        for msg in recent.iter().rev() {
+                            let role = msg["role"].as_str().unwrap_or("?");
+                            let content = msg
+                                .get("content")
+                                .and_then(|c| {
+                                    if let Some(s) = c.as_str() {
+                                        Some(s.to_string())
+                                    } else if let Some(arr) = c.as_array() {
+                                        let texts: Vec<String> = arr
+                                            .iter()
+                                            .filter_map(|b| b["text"].as_str().map(String::from))
+                                            .collect();
+                                        if texts.is_empty() { None } else { Some(texts.join(" ")) }
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_else(|| "(tool use)".to_string());
+                            let truncated = if content.len() > 200 {
+                                format!("{}...", &content[..200])
+                            } else {
+                                content
+                            };
+                            match role {
+                                "user" => self.messages.push(MessageEntry::User(truncated)),
+                                "assistant" => self.messages.push(MessageEntry::Assistant(truncated)),
+                                _ => self.messages.push(MessageEntry::System(
+                                    format!("  [{}] {}", role, truncated),
+                                )),
+                            }
+                        }
+
+                        self.messages.push(MessageEntry::System(format!(
+                            "  Session resumed: {} ({} messages, {} / {})",
+                            &session_id[..8.min(session_id.len())],
+                            msg_count,
+                            model,
+                            provider,
+                        )));
+
+                        // Send resume event to engine via special prefix
+                        let resume_payload = serde_json::json!({
+                            "__resume": true,
+                            "session_id": session_id,
+                            "messages": messages,
+                        });
+                        let _ = self.tx_to_engine.try_send(
+                            format!("__resume:{}", resume_payload)
+                        );
+                    }
                 },
                 Err(e) => {
                     self.messages

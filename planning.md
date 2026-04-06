@@ -20,9 +20,10 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
                 │     └── Markdown + syntax highlighting + diff viewer
                 ├──→ Bare mode (stdin/stdout, no TUI)
                 ├──→ Context System (CLAUDE.md, git status, system prompt)
+                ├──→ Auth System (Google OAuth2 + PKCE, credential store, env var fallback)
                 ├──→ Permission System (5 modes, path safety, session rules)
                 ├──→ Cost Tracker (token usage, $/model, budget enforcement)
-                ├──→ Session Persistence (JSON save/load/list/resume)
+                ├──→ Session Persistence (JSONL append-only, project-scoped, compact boundaries)
                 ├──→ Compaction Service (microcompact + LLM auto-compact, circuit breaker)
                 ├──→ MCP Client (JSON-RPC 2.0 over stdio/SSE/HTTP)
                 ├──→ Plugin System (~/.rust-agent/plugins/)
@@ -94,8 +95,8 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 ### Phase 6: Systems ✅ DONE
 
 - [x] **6.1** Context system — `context/` module: CLAUDE.md loading (global + project), git context, system info
-- [x] **6.2** Session persistence — JSON save/load/list at `~/.rust-agent/sessions/`
-- [x] **6.3** Session resume — `/resume` command
+- [x] **6.2** Session persistence — JSONL append-only save/load/list at `~/.rust-agent/sessions/<project>/`
+- [x] **6.3** Session resume — `/resume` command with `ResumeSession` result variant
 - [x] **6.4** Command history — up/down arrow recall in TUI
 - [x] **6.5** Slash commands — 33 commands in registry
 - [x] **6.6** Keybindings — 18 contexts, 70+ actions, chord sequences, user overrides
@@ -120,7 +121,8 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 ### Phase 8: Advanced (Future) 🔲
 
 - [ ] **8.1** Parallel tool execution for OpenAI/Gemini providers
-- [ ] **8.2** OAuth / API key management (`/login`, `/logout`)
+- [x] **8.2** OAuth / API key management (`/login`, `/logout`, `/auth-status`) — Google OAuth2 + PKCE for Gemini
+- [x] **8.2b** Session JSONL upgrade — append-only, project-scoped, crash-safe with compact boundaries
 - [ ] **8.3** GitHub integration (`/pr`, `/issue`, PR review automation)
 - [ ] **8.4** IDE bridge (VS Code extension integration)
 - [ ] **8.5** Coordinator mode (multi-agent orchestration)
@@ -139,7 +141,7 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 | Category | TS Original | Rust Port | Coverage |
 |----------|------------|-----------|----------|
 | Tools | ~35 | 23 | ~66% |
-| Commands | ~70 | 33 | ~47% |
+| Commands | ~70 | 36 | ~51% |
 | Providers | 3 | 3 + compatible | 100% |
 | Streaming | All | All | 100% |
 | Permissions | 5 modes | 5 modes | 100% |
@@ -148,12 +150,12 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 | Plugins | Full | Full | 100% |
 | Skills | Full | Full | 100% |
 | TUI | React/Ink | ratatui | ~90% |
-| OAuth | Yes | No | 0% |
+| OAuth | Yes | Gemini (Google OAuth2 + PKCE) | ~33% |
 | IDE Bridge | Yes | No | 0% |
 | Coordinator | Yes | No | 0% |
 | Voice | Yes | No | 0% |
 
-**Overall port progress: ~75-80%**
+**Overall port progress: ~80%**
 
 ---
 
@@ -162,11 +164,14 @@ CLI (clap) ──→ main.rs ──→ QueryEngine ──→ LLM API (Anthropic/
 ```
 src/
   main.rs                           # CLI + 3 modes (one-shot, bare, TUI)
+  auth/
+    mod.rs, credentials.rs          # OAuth credential store + token management
+    oauth.rs, client_config.rs      # PKCE flow, localhost callback, token exchange
   engine/
     mod.rs, config.rs, query.rs     # Core engine + agentic loop
     streaming.rs, tokens.rs         # SSE parser + token estimation
     cost_tracker.rs, compaction.rs  # Cost + context management
-    session.rs, state.rs            # Persistence + shared state
+    session.rs, state.rs            # JSONL persistence + shared state
     agent_tool.rs                   # Sub-agent spawning
   tools/
     mod.rs, registry.rs             # Tool trait + 23-tool registry
@@ -184,7 +189,7 @@ src/
     dialogs/                        # Model/theme/settings dialogs
     diff_viewer.rs, highlight.rs    # Diff + syntax highlighting
     markdown.rs                     # Markdown → ratatui
-  commands/                         # 33 slash commands
+  commands/                         # 36 slash commands (incl. login/logout/auth-status)
   keybindings/                      # 18 contexts, 70+ actions
   permissions/                      # 5-mode permission system
   context/                          # CLAUDE.md + git + sysinfo
@@ -218,6 +223,9 @@ src/
 | uuid              | 1.0       | Session IDs                  | ✅         |
 | chrono            | 0.4       | Date/time                    | ✅         |
 | ferris-says       | 0.3       | Welcome banner               | ✅         |
+| sha2              | 0.10      | PKCE code challenge (OAuth)  | ✅         |
+| base64            | 0.22      | PKCE encoding                | ✅         |
+| rand              | 0.8       | PKCE + state nonce generation| ✅         |
 
 ---
 

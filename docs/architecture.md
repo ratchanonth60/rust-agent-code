@@ -42,6 +42,11 @@
                              │
                     Results fed back to LLM
                     until final text answer
+
+                    ┌─────────────────────────┐
+                    │     Auth / Credential    │
+                    │   OAuth2 → env var → err │
+                    └─────────────────────────┘
 ```
 
 ## TUI Architecture
@@ -73,6 +78,13 @@
 src/
 ├── main.rs                         Entry point, CLI args, 3 execution modes
 │
+├── auth/                           Authentication & credential management
+│   ├── mod.rs                      resolve_gemini_token() facade
+│   ├── credentials.rs              CredentialStore + TokenCredential (load/save)
+│   ├── oauth.rs                    PKCE generation, callback server, token exchange
+│   ├── client_config.rs            OAuthClientConfig (Google endpoints)
+│   └── resolver.rs                 Auth chain: OAuth → env var → error
+│
 ├── engine/                         LLM query engine
 │   ├── mod.rs                      Re-exports and module layout docs
 │   ├── config.rs                   EngineConfig (auto_mode, max_tokens, etc.)
@@ -83,7 +95,7 @@ src/
 │   ├── tokens.rs                   Token estimation + context window map
 │   ├── compaction.rs               Microcompact + LLM auto-compact + circuit breaker
 │   ├── streaming.rs                Claude SSE stream parser
-│   ├── session.rs                  Session persistence (JSON save/load/list)
+│   ├── session.rs                  Session persistence (JSONL append-only, project-scoped)
 │   ├── state.rs                    SharedEngineState (Arc<RwLock<...>>)
 │   └── providers/                  Provider-specific agentic loops
 │       ├── mod.rs                  Module declarations
@@ -139,7 +151,7 @@ src/
 │   └── markdown.rs                 pulldown-cmark → ratatui spans
 │
 ├── commands/                       Slash command system
-│   ├── mod.rs                      build_default_registry() (33 commands)
+│   ├── mod.rs                      build_default_registry() (36 commands)
 │   ├── types.rs                    Command trait, CommandResult, CommandContext
 │   ├── registry.rs                 CommandRegistry (name + alias lookup)
 │   ├── help.rs                     /help
@@ -169,6 +181,9 @@ src/
 │   ├── compact.rs                  /compact
 │   ├── export.rs                   /export
 │   ├── resume.rs                   /resume
+│   ├── login.rs                    /login (OAuth browser flow)
+│   ├── logout.rs                   /logout (revoke + remove tokens)
+│   ├── auth_status.rs              /auth-status (show credential state)
 │   ├── mcp.rs                      /mcp
 │   └── skill.rs                    /skill
 │
@@ -267,3 +282,33 @@ The TUI communicates with the engine via `tokio::sync::mpsc` channels:
 - `rx_questions` — `AskUserQuestionTool` prompts
 
 This keeps the UI thread responsive while the engine runs async tool-use loops.
+
+### Auth Fallback Chain
+
+Gemini authentication uses a priority chain with zero breaking changes:
+
+```
+CredentialStore (OAuth2 token, auto-refresh if expired)
+  ↓ not found or refresh failed
+GEMINI_API_KEY env var
+  ↓ not found
+Error with helpful message
+```
+
+OAuth uses **Authorization Code + PKCE (S256)** with a localhost callback server.
+Credentials are stored in `~/.rust-agent/credentials.json` (chmod 600). The flow
+opens the user's browser, Google redirects to `http://127.0.0.1:<random-port>/`,
+and the agent exchanges the code for tokens.
+
+### Session JSONL Format
+
+Sessions use append-only JSONL (one JSON object per line) for crash safety:
+
+```
+~/.rust-agent/sessions/<project-hash-16char>/<session-id>.jsonl
+```
+
+Each line is tagged by `type`: `header`, `message`, `compact_boundary`, or `cost`.
+On load, `compact_boundary` entries clear all preceding messages, which enables
+context compaction without rewriting the file. Legacy `.json` files are still
+loadable for backward compatibility.

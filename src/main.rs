@@ -6,6 +6,7 @@
 //! - **Interactive** (default) — full ratatui TUI with streaming,
 //!   tool dots, permission prompts, and slash commands.
 
+pub mod auth;
 pub mod commands;
 pub mod config;
 pub mod context;
@@ -235,6 +236,30 @@ async fn main() -> anyhow::Result<()> {
 
         tokio::spawn(async move {
             while let Some(query) = rx_to_engine.recv().await {
+                // Handle session resume via special prefix.
+                if let Some(payload) = query.strip_prefix("__resume:") {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(payload) {
+                        if let Some(messages) = parsed.get("messages").and_then(|m| m.as_array()) {
+                            let msgs: Vec<serde_json::Value> = messages.clone();
+                            if let Ok(mut session) = engine_clone.session.lock() {
+                                session.messages = msgs;
+                                session.saved_message_count = session.messages.len();
+                                session.header_written = true;
+                            }
+                            let _ = tx_to_ui
+                                .send(ui::app::UiEvent::LLMResponse(
+                                    "Session restored. You can continue the conversation.".to_string(),
+                                ))
+                                .await;
+                            continue;
+                        }
+                    }
+                    let _ = tx_to_ui
+                        .send(ui::app::UiEvent::LLMError("Failed to parse resume payload.".to_string()))
+                        .await;
+                    continue;
+                }
+
                 match engine_clone.query(&query, Some(tx_to_ui.clone())).await {
                     Ok(response) => {
                         let _ = tx_to_ui.send(ui::app::UiEvent::LLMResponse(response)).await;

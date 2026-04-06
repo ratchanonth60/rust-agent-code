@@ -106,9 +106,15 @@ impl QueryEngine {
                             .unwrap_or_default()
                     }
                     ModelProvider::Gemini => {
-                        std::env::var("GEMINI_API_KEY")
-                            .or_else(|_| std::env::var("LLM_API_KEY"))
-                            .unwrap_or_default()
+                        // Try OAuth token first, then env vars.
+                        crate::auth::resolve_gemini_token()
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| {
+                                std::env::var("GEMINI_API_KEY")
+                                    .or_else(|_| std::env::var("LLM_API_KEY"))
+                                    .unwrap_or_default()
+                            })
                     }
                     _ => String::new(),
                 });
@@ -117,7 +123,7 @@ impl QueryEngine {
                     let env_var_desc = match provider {
                         ModelProvider::OpenAI => "OPENAI_API_KEY",
                         ModelProvider::OpenAICompatible => "OPENAI_COMPAT_API_KEY, OPENAI_API_KEY, or LLM_API_KEY",
-                        ModelProvider::Gemini => "GEMINI_API_KEY",
+                        ModelProvider::Gemini => "GEMINI_API_KEY (or use /login gemini)",
                         _ => unreachable!(),
                     };
                     return Err(anyhow!(
@@ -329,13 +335,13 @@ impl QueryEngine {
         }
     }
 
-    /// Persist the current conversation state to disk after each tool-use round-trip.
+    /// Persist new conversation messages to disk (append-only JSONL).
     ///
-    /// Serialises the provider-specific message history into the session's
-    /// `messages` vec and calls [`Session::save`].  Errors are logged but
-    /// do not abort the agentic loop.
+    /// Only appends messages added since the last save — no full rewrite.
+    /// Errors are logged but do not abort the agentic loop.
     pub(crate) fn auto_save_session(&self, messages: &[Value]) {
         if let Ok(mut session) = self.session.lock() {
+            // Replace in-memory messages and let Session.save() append only new ones.
             session.messages = messages.to_vec();
             if let Err(e) = session.save() {
                 info!("Auto-save failed: {}", e);

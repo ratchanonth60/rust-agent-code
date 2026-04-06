@@ -47,12 +47,15 @@ git clone https://github.com/ratchanonth60/rust-agent-code.git
 cd rust-agent-code
 cargo build --release
 
-# Set your API key
+# Option A: Set an API key
 export GEMINI_API_KEY=your-key-here    # default provider
 # or
 export ANTHROPIC_API_KEY=your-key-here # for Claude
 # or
 export OPENAI_API_KEY=your-key-here    # for OpenAI
+
+# Option B: Login via Google OAuth (opens browser)
+cargo run -- --login-gemini
 
 # Launch the TUI
 cargo run
@@ -83,9 +86,9 @@ cargo run -- --bare
 
 Rust Agent supports four LLM backends. Switch with `--provider`:
 
-| Provider | Flag | Default Model | API Key Env |
-|----------|------|---------------|-------------|
-| **Gemini** | `--provider gemini` | `gemini-2.5-flash` | `GEMINI_API_KEY` |
+| Provider | Flag | Default Model | Auth |
+|----------|------|---------------|------|
+| **Gemini** | `--provider gemini` | `gemini-2.5-flash` | OAuth2 or `GEMINI_API_KEY` |
 | **Claude** | `--provider claude` | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` |
 | **OpenAI** | `--provider openai` | `gpt-4o-mini` | `OPENAI_API_KEY` |
 | **OpenAI-compatible** | `--provider open-ai-compatible` | `gpt-4o-mini` | `OPENAI_COMPAT_API_KEY` |
@@ -95,6 +98,32 @@ Each provider has its own streaming implementation:
 - **Claude** — native Anthropic Messages API with SSE + parallel tool execution
 - **OpenAI** — async-openai with `create_stream`
 - **Gemini** — raw HTTP SSE with `thought_signature` preservation for thinking models
+
+### Authentication
+
+Gemini supports two auth methods. The agent tries OAuth first, then falls back to env var:
+
+```
+OAuth2 token (auto-refresh) → GEMINI_API_KEY env var → error
+```
+
+**Browser-based OAuth login:**
+
+```bash
+# Login (opens Google consent screen in browser)
+cargo run -- --login-gemini
+
+# Or use the slash command in the TUI
+/login gemini
+
+# Check auth status
+/auth-status
+
+# Logout
+/logout gemini
+```
+
+OAuth uses **PKCE (S256)** with a localhost callback server. Credentials are stored in `~/.rust-agent/credentials.json` (chmod 600).
 
 ---
 
@@ -162,7 +191,7 @@ See [docs/tools.md](docs/tools.md) for the full tool reference.
 
 ## Slash Commands
 
-33 slash commands for in-session control:
+36 slash commands for in-session control:
 
 | Command | Description |
 |---------|-------------|
@@ -175,10 +204,13 @@ See [docs/tools.md](docs/tools.md) for the full tool reference.
 | `/review` | Review code changes |
 | `/compact` | Compact conversation context |
 | `/resume` | Resume a previous session |
+| `/login` | OAuth login (opens browser) |
+| `/logout` | Remove stored credentials |
+| `/auth-status` | Show authentication status |
 | `/mcp` | MCP server management |
 | `/doctor` | Run diagnostics |
 
-*...and 22 more. Type `/help` in the TUI to see all.*
+*...and 25 more. Type `/help` in the TUI to see all.*
 
 ---
 
@@ -216,12 +248,15 @@ cargo run -- --permission-mode accept-edits --max-budget 1.00
 | `--max-tokens <N>` | Output token limit | `8192` |
 | `--max-budget <USD>` | Session budget cap | unlimited |
 | `--permission-mode <MODE>` | Permission mode | `default` |
+| `--login-gemini` | Login to Gemini via Google OAuth | — |
+| `--logout-gemini` | Remove Gemini OAuth credentials | — |
 
 ### Config Files
 
 | File | Location | Purpose |
 |------|----------|---------|
 | `config.json` | `~/.rust-agent/` | Global preferences |
+| `credentials.json` | `~/.rust-agent/` | OAuth tokens (chmod 600) |
 | `keybindings.json` | `~/.rust-agent/` | Custom key mappings |
 | `mcp.json` | `~/.rust-agent/` | MCP server definitions |
 | `MEMORY.md` | `~/.rust-agent/memory/` | Persistent agent memory |
@@ -236,7 +271,8 @@ cargo run -- --permission-mode accept-edits --max-budget 1.00
 |--------|-------------|
 | **Cost Tracking** | Per-model token usage and USD cost with budget enforcement |
 | **Context Management** | Token estimation, microcompact, LLM auto-compact with circuit breaker |
-| **Session Persistence** | JSON save/load/list/resume at `~/.rust-agent/sessions/` |
+| **Authentication** | Google OAuth2 (PKCE) for Gemini, env var fallback for all providers |
+| **Session Persistence** | JSONL append-only save/load/resume at `~/.rust-agent/sessions/<project>/` |
 | **Persistent Memory** | File-based at `~/.rust-agent/memory/` with MEMORY.md index |
 | **Task Registry** | Unified background task tracking (shell + agent) with TUI pill |
 | **MCP Client** | JSON-RPC 2.0 over stdio/SSE/HTTP with tool/resource discovery |
@@ -267,6 +303,8 @@ cargo run -- --permission-mode accept-edits --max-budget 1.00
 | `ratatui` + `crossterm` | Terminal UI |
 | `clap` | CLI argument parsing |
 | `serde` + `serde_json` | Serialization |
+| `sha2` | PKCE code challenge (OAuth) |
+| `base64` | PKCE encoding |
 | `pulldown-cmark` | Markdown rendering |
 | `syntect` | Syntax highlighting |
 
@@ -277,7 +315,6 @@ cargo run -- --permission-mode accept-edits --max-budget 1.00
 See [planning.md](planning.md) for the full roadmap. Key upcoming work:
 
 - Parallel tool execution for OpenAI/Gemini
-- OAuth / API key management
 - GitHub integration (`/pr`, `/issue`)
 - Coordinator mode (multi-agent orchestration)
 - Sandbox/container execution
