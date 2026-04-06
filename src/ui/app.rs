@@ -188,6 +188,10 @@ pub struct App {
     active_dialog: ActiveDialog,
     /// Boxed dialog widget for the current overlay.
     dialog_widget: Option<Box<dyn Dialog>>,
+    /// Active model name displayed in the status line.
+    pub model_name: Option<String>,
+    /// Active provider label displayed in the status line.
+    pub provider_name: Option<String>,
 }
 
 struct PendingPermission {
@@ -259,6 +263,8 @@ impl App {
             file_index: None,
             active_dialog: ActiveDialog::None,
             dialog_widget: None,
+            model_name: None,
+            provider_name: None,
         }
     }
 

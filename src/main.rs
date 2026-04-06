@@ -253,6 +253,10 @@ async fn main() -> anyhow::Result<()> {
         let (question_tx, question_rx) =
             mpsc::channel::<crate::tools::ask_user::QuestionRequest>(8);
 
+        // Snapshot for status line (before model string is moved into engine).
+        let display_model = active_model.clone();
+        let display_provider = format!("{:?}", active_provider);
+
         let engine = QueryEngine::new(
             active_model,
             active_provider,
@@ -324,6 +328,8 @@ async fn main() -> anyhow::Result<()> {
         let mut app = ui::app::App::new(tx_to_engine, rx_to_ui, question_rx, command_registry);
         app.cost_tracker = Some(cost_tracker.clone());
         app.task_registry = Some(task_registry);
+        app.model_name = Some(display_model);
+        app.provider_name = Some(display_provider);
 
         let app_result = app.run(&mut terminal).await;
 

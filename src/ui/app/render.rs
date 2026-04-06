@@ -343,7 +343,13 @@ impl App {
             .map(crate::tasks::pill_label::pill_label)
             .unwrap_or_default();
 
-        // Right: cost if available
+        // Right: model/provider tag + cost if available
+        let model_tag = match (&self.model_name, &self.provider_name) {
+            (Some(m), Some(p)) => format!(" {}:{} ", p, m),
+            (Some(m), None) => format!(" {} ", m),
+            _ => String::new(),
+        };
+
         let right = if let Some(ref tracker) = self.cost_tracker {
             if let Ok(t) = tracker.lock() {
                 if t.total_cost_usd > 0.0 {
@@ -358,7 +364,8 @@ impl App {
             String::new()
         };
 
-        let fill_len = w.saturating_sub(left.len() + task_pill.len() + right.len());
+        let fill_len =
+            w.saturating_sub(left.len() + task_pill.len() + model_tag.len() + right.len());
         let rail_char = RAIL_FRAMES[self.frame_ticker % RAIL_FRAMES.len()];
         let fill: String = std::iter::repeat_n(rail_char, fill_len).collect();
 
@@ -371,6 +378,9 @@ impl App {
                 task_pill,
                 Style::default().fg(Color::Black).bg(Color::Yellow),
             ));
+        }
+        if !model_tag.is_empty() {
+            spans.push(Span::styled(model_tag, Style::default().fg(Color::Magenta)));
         }
         spans.push(Span::styled(right, Style::default().fg(Color::Green)));
 
