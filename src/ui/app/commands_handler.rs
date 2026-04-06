@@ -4,7 +4,7 @@
 //! being sent to the LLM engine. This module handles:
 //!
 //! - **Special-case commands**: `/help` (needs registry access), dialog openers
-//!   (`/settings`, `/model`, `/theme`).
+//!   (`/settings`, `/model`, `/theme`, `/resume`).
 //! - **Registry lookup**: Finds the matching [`Command`] by name or alias.
 //! - **Result handling**: Maps [`CommandResult`] variants to UI actions (display
 //!   text, clear conversation, exit, etc.).
@@ -18,9 +18,11 @@
 //! | `/settings`   | Opens the full settings editor  |
 //! | `/model`      | Opens the model picker dialog   |
 //! | `/theme`      | Opens the theme picker dialog   |
+//! | `/resume`     | Opens the session picker dialog |
 //!
 //! If `/model` or `/theme` are invoked with arguments (e.g., `/model gpt-4o`),
 //! they fall through to the registry command for direct value setting.
+//! `/resume <id>` falls through to the registry for direct session loading.
 
 use crate::commands::{CommandContext, CommandResult};
 use crate::ui::dialogs::ActiveDialog;
@@ -37,7 +39,7 @@ impl App {
     /// # Command resolution order
     ///
     /// 1. `/help` — special-cased because it needs `command_registry.list()`
-    /// 2. Dialog commands — `/settings`, `/model` (no args), `/theme` (no args)
+    /// 2. Dialog commands — `/settings`, `/model` (no args), `/theme` (no args), `/resume` (no args)
     /// 3. Registry lookup — finds command by name or alias
     /// 4. Unknown command — displays error message
     pub(super) fn handle_slash_command(&mut self, cmd: &str) {
@@ -63,7 +65,7 @@ impl App {
         }
 
         // Dialog commands — open overlay dialogs instead of running a command.
-        // /model and /theme only open dialogs when called without arguments;
+        // /model, /theme, /resume only open dialogs when called without arguments;
         // with arguments they fall through to the registry for direct setting.
         match command_name {
             "settings" => {
@@ -76,6 +78,10 @@ impl App {
             }
             "theme" if args.is_empty() => {
                 self.open_dialog(ActiveDialog::ThemePicker);
+                return;
+            }
+            "resume" if args.is_empty() => {
+                self.open_dialog(ActiveDialog::SessionPicker);
                 return;
             }
             _ => {}
@@ -117,61 +123,7 @@ impl App {
                         model,
                         provider,
                     } => {
-                        let msg_count = messages.len();
-                        self.messages.clear();
-                        self.scroll_offset = 0;
-
-                        // Display recent conversation context in TUI
-                        let recent: Vec<_> = messages.iter().rev().take(6).collect();
-                        for msg in recent.iter().rev() {
-                            let role = msg["role"].as_str().unwrap_or("?");
-                            let content = msg
-                                .get("content")
-                                .and_then(|c| {
-                                    if let Some(s) = c.as_str() {
-                                        Some(s.to_string())
-                                    } else if let Some(arr) = c.as_array() {
-                                        let texts: Vec<String> = arr
-                                            .iter()
-                                            .filter_map(|b| b["text"].as_str().map(String::from))
-                                            .collect();
-                                        if texts.is_empty() { None } else { Some(texts.join(" ")) }
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or_else(|| "(tool use)".to_string());
-                            let truncated = if content.len() > 200 {
-                                format!("{}...", &content[..200])
-                            } else {
-                                content
-                            };
-                            match role {
-                                "user" => self.messages.push(MessageEntry::User(truncated)),
-                                "assistant" => self.messages.push(MessageEntry::Assistant(truncated)),
-                                _ => self.messages.push(MessageEntry::System(
-                                    format!("  [{}] {}", role, truncated),
-                                )),
-                            }
-                        }
-
-                        self.messages.push(MessageEntry::System(format!(
-                            "  Session resumed: {} ({} messages, {} / {})",
-                            &session_id[..8.min(session_id.len())],
-                            msg_count,
-                            model,
-                            provider,
-                        )));
-
-                        // Send resume event to engine via special prefix
-                        let resume_payload = serde_json::json!({
-                            "__resume": true,
-                            "session_id": session_id,
-                            "messages": messages,
-                        });
-                        let _ = self.tx_to_engine.try_send(
-                            format!("__resume:{}", resume_payload)
-                        );
+                        self.apply_resume_session(session_id, messages, model, provider);
                     }
                 },
                 Err(e) => {
@@ -186,5 +138,73 @@ impl App {
             )));
         }
         self.auto_scroll();
+    }
+
+    /// Apply a session resume — clear TUI, show recent messages, send to engine.
+    ///
+    /// Used by both `CommandResult::ResumeSession` (from `/resume <id>`) and
+    /// the `SessionPicker` dialog.
+    pub(super) fn apply_resume_session(
+        &mut self,
+        session_id: String,
+        messages: Vec<serde_json::Value>,
+        model: String,
+        provider: String,
+    ) {
+        let msg_count = messages.len();
+        self.messages.clear();
+        self.scroll_offset = 0;
+
+        // Display recent conversation context in TUI
+        let recent: Vec<_> = messages.iter().rev().take(6).collect();
+        for msg in recent.iter().rev() {
+            let role = msg["role"].as_str().unwrap_or("?");
+            let content = msg
+                .get("content")
+                .and_then(|c| {
+                    if let Some(s) = c.as_str() {
+                        Some(s.to_string())
+                    } else if let Some(arr) = c.as_array() {
+                        let texts: Vec<String> = arr
+                            .iter()
+                            .filter_map(|b| b["text"].as_str().map(String::from))
+                            .collect();
+                        if texts.is_empty() { None } else { Some(texts.join(" ")) }
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "(tool use)".to_string());
+            let truncated = if content.len() > 200 {
+                format!("{}...", &content[..200])
+            } else {
+                content
+            };
+            match role {
+                "user" => self.messages.push(MessageEntry::User(truncated)),
+                "assistant" => self.messages.push(MessageEntry::Assistant(truncated)),
+                _ => self.messages.push(MessageEntry::System(
+                    format!("  [{}] {}", role, truncated),
+                )),
+            }
+        }
+
+        self.messages.push(MessageEntry::System(format!(
+            "  Session resumed: {} ({} messages, {} / {})",
+            &session_id[..8.min(session_id.len())],
+            msg_count,
+            model,
+            provider,
+        )));
+
+        // Send resume event to engine via special prefix
+        let resume_payload = serde_json::json!({
+            "__resume": true,
+            "session_id": session_id,
+            "messages": messages,
+        });
+        let _ = self.tx_to_engine.try_send(
+            format!("__resume:{}", resume_payload)
+        );
     }
 }

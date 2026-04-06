@@ -44,12 +44,49 @@ use crate::tools::{Tool, ToolContext};
 /// LLM provider selection.
 ///
 /// Parsed from the `--provider` CLI flag via [`clap::ValueEnum`].
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ModelProvider {
     OpenAI,
     Gemini,
     Claude,
     OpenAICompatible,
+}
+
+/// Check whether an API key is available for the given provider.
+///
+/// Returns `Some(key)` if found via the auth chain (OAuth, env var),
+/// or `None` if no key is configured. Used by the TUI to decide
+/// whether to show the setup dialog before creating a [`QueryEngine`].
+pub fn resolve_api_key(provider: ModelProvider, api_key_override: Option<&str>) -> Option<String> {
+    if let Some(key) = api_key_override {
+        return Some(key.to_string());
+    }
+    let key = match provider {
+        ModelProvider::Claude => {
+            std::env::var("ANTHROPIC_API_KEY")
+                .or_else(|_| std::env::var("CLAUDE_API_KEY"))
+                .unwrap_or_default()
+        }
+        ModelProvider::OpenAI => {
+            std::env::var("OPENAI_API_KEY").unwrap_or_default()
+        }
+        ModelProvider::Gemini => {
+            // OAuth first, then env vars
+            if let Ok(Some(token)) = crate::auth::resolve_gemini_token() {
+                return Some(token);
+            }
+            std::env::var("GEMINI_API_KEY")
+                .or_else(|_| std::env::var("LLM_API_KEY"))
+                .unwrap_or_default()
+        }
+        ModelProvider::OpenAICompatible => {
+            std::env::var("OPENAI_COMPAT_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .or_else(|_| std::env::var("LLM_API_KEY"))
+                .unwrap_or_default()
+        }
+    };
+    if key.is_empty() { None } else { Some(key) }
 }
 
 /// The central agentic engine that drives the tool-use loop.
